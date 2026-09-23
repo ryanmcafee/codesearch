@@ -82,7 +82,7 @@ impl CodesearchService {
             let mut all_items: Vec<FileOutlineItem> = Vec::new();
             let mut seen_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
             for (store_idx, store_arc) in sv.iter().enumerate() {
-                let store = store_arc.vector_store.read().await;
+                let store = &store_arc.vector_store;
                 match store.chunks_for_file(normalized) {
                     Ok(metas) => {
                         for c in metas {

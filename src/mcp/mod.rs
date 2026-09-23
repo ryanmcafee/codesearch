@@ -1263,14 +1263,14 @@ impl CodesearchService {
     {
         // Priority 1: explicit store override (from project/group routing)
         if let Some(stores) = store_override {
-            let store = stores.vector_store.read().await;
-            return action(&store).context("Error reading from project-routed vector store");
+            let store = &stores.vector_store;
+            return action(store).context("Error reading from project-routed vector store");
         }
 
         // Priority 2: shared stores (set during IndexManager init)
         if let Some(ref stores) = self.shared_stores {
-            let store = stores.vector_store.read().await;
-            match action(&store) {
+            let store = &stores.vector_store;
+            match action(store) {
                 Ok(result) => return Ok(result),
                 Err(shared_err) => {
                     tracing::error!("Shared vector store read failed: {:?}", shared_err);
@@ -1306,14 +1306,14 @@ impl CodesearchService {
     {
         // Priority 1: explicit store override (from project/group routing)
         if let Some(stores) = store_override {
-            let fts = stores.fts_store.read().await;
-            return action(&fts);
+            let fts = &stores.fts_store;
+            return action(fts);
         }
 
         // Priority 2: shared stores
         if let Some(ref stores) = self.shared_stores {
-            let fts = stores.fts_store.read().await;
-            return action(&fts);
+            let fts = &stores.fts_store;
+            return action(fts);
         }
 
         // Fallback: open a new FtsStore
@@ -1350,8 +1350,8 @@ impl CodesearchService {
 
         for (idx, store_arc) in stores.iter().enumerate() {
             let alias = aliases.get(idx).map(|s| s.as_str()).unwrap_or("unknown");
-            let store = store_arc.vector_store.read().await;
-            match action(alias, &store) {
+            let store = &store_arc.vector_store;
+            match action(alias, store) {
                 Ok(results) => {
                     for r in results {
                         let key = (alias.to_string(), r.chunk_id());
@@ -1420,8 +1420,8 @@ impl CodesearchService {
 
         for (idx, store_arc) in stores.iter().enumerate() {
             let alias = aliases.get(idx).map(|s| s.as_str()).unwrap_or("unknown");
-            let fts = store_arc.fts_store.read().await;
-            match action(&fts) {
+            let fts = &store_arc.fts_store;
+            match action(fts) {
                 Ok(results) => {
                     for r in results {
                         let key = (alias.to_string(), r.chunk_id());

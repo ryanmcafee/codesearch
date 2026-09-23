@@ -2386,7 +2386,7 @@ impl ServeState {
                 // `index_health()` (not `stats()`) on purpose: this arm is the
                 // cheap path that keeps the 2 GiB replica alive, and `stats()`
                 // would deserialize every chunk just to count unique paths.
-                match stores.vector_store.read().await.index_health() {
+                match stores.vector_store.index_health() {
                     Ok((total_chunks, false)) if total_chunks > 0 => warn!(
                         "Warmup '{}': opened READ-ONLY but its vector index has no HNSW graph \
                          ({} chunks present). Semantic search will return 0 results for this \
@@ -2418,7 +2418,7 @@ impl ServeState {
         // exactly `(total_chunks, indexed)` and `stats()` would deserialize
         // every chunk in the store just to count unique file paths.
         let needs_build = {
-            let vstore = stores.vector_store.read().await;
+            let vstore = &stores.vector_store;
             match vstore.index_health() {
                 Ok((total_chunks, false)) if total_chunks > 0 => Some(total_chunks),
                 Ok(_) => None,
@@ -2435,7 +2435,7 @@ impl ServeState {
             );
             let vector_store = Arc::clone(&stores.vector_store);
             match tokio::task::spawn_blocking(move || {
-                let mut vstore = vector_store.blocking_write();
+                let vstore = &vector_store;
                 vstore.build_index()
             })
             .await
@@ -2596,7 +2596,7 @@ impl ServeState {
             let vector_store = Arc::clone(&stores.vector_store);
             let alias_owned = alias.to_string();
             match tokio::task::spawn_blocking(move || {
-                let mut vstore = vector_store.blocking_write();
+                let vstore = &vector_store;
                 // `index_health()`, not `stats()` — the predicate needs exactly
                 // `(total_chunks, indexed)`, while `stats()` deserializes every
                 // ChunkMetadata in the store just to count unique file paths.
@@ -3847,7 +3847,8 @@ async fn info_handler(
 
     // If stores are open, live stats override metadata.
     if let Some(stores) = state.get_opened_stores(&alias) {
-        if let Ok(vs) = stores.vector_store.try_read() {
+        {
+            let vs = &stores.vector_store;
             if let Ok(live_stats) = vs.stats() {
                 chunks = live_stats.total_chunks;
                 files = live_stats.total_files;
@@ -3923,8 +3924,8 @@ async fn doctor_handler(
     let pp = project_path.clone();
     let report = tokio::task::spawn_blocking(move || match opened {
         Some(stores) => {
-            let vs = stores.vector_store.blocking_read();
-            crate::cli::doctor::diagnose_with_store(&pp, &vs)
+            let vs = &stores.vector_store;
+            crate::cli::doctor::diagnose_with_store(&pp, vs)
         }
         None => crate::cli::doctor::diagnose(&pp),
     })
@@ -4751,7 +4752,7 @@ async fn add_repo_handler(
             let vector_store = Arc::clone(&stores.vector_store);
             let alias_bi = alias_bg.clone();
             match tokio::task::spawn_blocking(move || {
-                let mut vstore = vector_store.blocking_write();
+                let vstore = &vector_store;
                 vstore.build_index()
             })
             .await

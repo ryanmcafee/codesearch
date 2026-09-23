@@ -165,7 +165,7 @@ impl CodesearchService {
             let mut failed_count = 0usize;
 
             for (i, store_arc) in sv.iter().enumerate() {
-                let store = store_arc.vector_store.read().await;
+                let store = &store_arc.vector_store;
                 match store.stats() {
                     Ok(stats) => {
                         total_chunks += stats.total_chunks;
@@ -325,7 +325,7 @@ impl CodesearchService {
                     // For unopened repos, just report metadata — do NOT open the DB.
                     if let Some(stores) = serve_state.get_opened_stores(alias) {
                         let stats_result = {
-                            let vs = stores.vector_store.read().await;
+                            let vs = &stores.vector_store;
                             vs.stats()
                         };
                         // `0 chunks` alone reads exactly like "not indexed yet" — the

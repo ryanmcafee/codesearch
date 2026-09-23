@@ -116,13 +116,13 @@ pub(crate) async fn require_prebuilt_index_ready(
     db_path: &Path,
 ) -> Result<()> {
     let (total_chunks, vector_indexed) = {
-        let vector_store = stores.vector_store.read().await;
+        let vector_store = &stores.vector_store;
         vector_store
             .index_health()
             .context("Failed to inspect prebuilt vector index")?
     };
     let fts_documents = {
-        let fts_store = stores.fts_store.read().await;
+        let fts_store = &stores.fts_store;
         fts_store
             .stats()
             .context("Failed to inspect prebuilt full-text index")?

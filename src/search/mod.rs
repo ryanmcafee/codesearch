@@ -1115,7 +1115,7 @@ fn sync_database(db_path: &Path, model_type: ModelType) -> Result<()> {
     let cache_dir = crate::constants::get_global_models_cache_dir()?;
     let mut embedding_service = EmbeddingService::with_cache_dir(model_type, Some(&cache_dir))?;
     let mut chunker = SemanticChunker::new(100, 2000, 10);
-    let mut store = VectorStore::new(db_path, model_type.dimensions())?;
+    let store = VectorStore::new(db_path, model_type.dimensions())?;
 
     let mut changes = 0;
 
@@ -1133,11 +1133,6 @@ fn sync_database(db_path: &Path, model_type: ModelType) -> Result<()> {
             sanitize_for_terminal(&file.path.display().to_string())
         );
 
-        // Delete old chunks
-        if !old_chunk_ids.is_empty() {
-            store.delete_chunks(&old_chunk_ids)?;
-        }
-
         // Read and chunk file
         let source_code = match std::fs::read_to_string(&file.path) {
             Ok(content) => content,
@@ -1147,13 +1142,14 @@ fn sync_database(db_path: &Path, model_type: ModelType) -> Result<()> {
         let chunks = chunker.chunk_semantic(file.language, &file.path, &source_code)?;
 
         if chunks.is_empty() {
+            store.delete_chunks(&old_chunk_ids)?;
             file_meta.update_file(&file.path, vec![])?;
             continue;
         }
 
-        // Embed and insert
+        // Embed, then swap old chunks for new in one write txn
         let embedded_chunks = embedding_service.embed_chunks(chunks)?;
-        let chunk_ids = store.insert_chunks_with_ids(embedded_chunks)?;
+        let chunk_ids = store.replace_chunks(&old_chunk_ids, embedded_chunks)?;
         file_meta.update_file(&file.path, chunk_ids)?;
     }
 

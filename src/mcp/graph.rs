@@ -58,7 +58,7 @@ impl CodesearchService {
             let mut all_items: Vec<ImportItem> = Vec::new();
             let mut seen_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
             for (store_idx, store_arc) in sv.iter().enumerate() {
-                let store = store_arc.vector_store.read().await;
+                let store = &store_arc.vector_store;
                 match store.chunks_for_file(&normalized) {
                     Ok(metas) => {
                         for meta in metas {
@@ -156,7 +156,7 @@ impl CodesearchService {
                 let mut resolved: Vec<ImportItem> = Vec::new();
                 for (chunk_id, _) in &all_hits {
                     for (store_idx, store_arc) in sv.iter().enumerate() {
-                        let store = store_arc.vector_store.read().await;
+                        let store = &store_arc.vector_store;
                         match store.get_chunk(*chunk_id) {
                             Ok(Some(chunk)) => {
                                 if crate::cache::normalize_path_str(&chunk.path) == normalized {
@@ -372,7 +372,7 @@ impl CodesearchService {
             let mut out = Vec::new();
             for f in &fts_results {
                 for (store_idx, store_arc) in sv.iter().enumerate() {
-                    let store = store_arc.vector_store.read().await;
+                    let store = &store_arc.vector_store;
                     match store.get_chunk(f.chunk_id) {
                         Ok(Some(chunk)) => {
                             if !is_import_kind(&chunk.kind) {
@@ -532,7 +532,7 @@ impl CodesearchService {
             let aliases = ctx.aliases();
             let mut embedding: Option<Vec<f32>> = None;
             for (i, store_arc) in sv.iter().enumerate() {
-                let store = store_arc.vector_store.read().await;
+                let store = &store_arc.vector_store;
                 match store.get_embedding(request.chunk_id) {
                     Ok(Some(emb)) => {
                         embedding = Some(emb);
@@ -571,7 +571,7 @@ impl CodesearchService {
             let mut all_results: Vec<SearchResultItem> = Vec::new();
             let mut seen_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
             for (store_idx, store_arc) in sv.iter().enumerate() {
-                let store = store_arc.vector_store.read().await;
+                let store = &store_arc.vector_store;
                 match store.search(&embedding, limit + 1) {
                     Ok(mut neighbors) => {
                         neighbors.retain(|r| r.id != request.chunk_id);

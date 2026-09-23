@@ -9,6 +9,7 @@
 
 use anyhow::{anyhow, Result};
 use std::path::Path;
+use std::sync::{Mutex, MutexGuard};
 use tantivy::{
     collector::TopDocs,
     directory::MmapDirectory,
@@ -36,7 +37,8 @@ pub struct FtsResult {
 pub struct FtsStore {
     index: Index,
     reader: IndexReader,
-    writer: Option<IndexWriter>,
+    /// Single writer; readers never take it (tantivy `Searcher`s are snapshots).
+    writer: Mutex<Option<IndexWriter>>,
     #[allow(dead_code)]
     schema: Schema,
     // Field handles
@@ -121,7 +123,7 @@ impl FtsStore {
         Ok(Self {
             index,
             reader,
-            writer: None, // Lazy-initialized on first write
+            writer: Mutex::new(None), // Lazy-initialized on first write
             schema,
             chunk_id_field,
             content_field,
@@ -155,7 +157,7 @@ impl FtsStore {
         Ok(Self {
             index,
             reader,
-            writer: None,
+            writer: Mutex::new(None),
             schema,
             chunk_id_field,
             content_field,
@@ -170,8 +172,8 @@ impl FtsStore {
     /// Use this when you know you'll be writing immediately (e.g., during indexing).
     /// For search-only or mixed workloads, use `new()` instead.
     pub fn new_with_writer(db_path: &Path) -> Result<Self> {
-        let mut store = Self::new(db_path)?;
-        store.ensure_writer()?;
+        let store = Self::new(db_path)?;
+        Self::ensure_writer(&store.index, &mut store.lock_writer())?;
         Ok(store)
     }
 
@@ -307,13 +309,16 @@ impl FtsStore {
     }
 
     /// Ensure writer is initialized for indexing
-    fn ensure_writer(&mut self) -> Result<()> {
-        if self.writer.is_none() {
+    fn ensure_writer(index: &Index, slot: &mut Option<IndexWriter>) -> Result<()> {
+        if slot.is_none() {
             // Use retry logic for Windows file locking issues
-            let writer = Self::create_writer_with_retry(&self.index)?;
-            self.writer = Some(writer);
+            *slot = Some(Self::create_writer_with_retry(index)?);
         }
         Ok(())
+    }
+
+    fn lock_writer(&self) -> MutexGuard<'_, Option<IndexWriter>> {
+        self.writer.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Add a chunk to the FTS index
@@ -321,14 +326,15 @@ impl FtsStore {
     /// Includes writer recovery: if the writer was killed (e.g., by a background
     /// merge thread panic), it will be recreated and the operation retried once.
     pub fn add_chunk(
-        &mut self,
+        &self,
         chunk_id: u32,
         content: &str,
         path: &str,
         signature: Option<&str>,
         kind: &str,
     ) -> Result<()> {
-        self.ensure_writer()?;
+        let mut slot = self.lock_writer();
+        Self::ensure_writer(&self.index, &mut slot)?;
 
         // Copy field handles before mutable borrow
         let chunk_id_field = self.chunk_id_field;
@@ -346,7 +352,7 @@ impl FtsStore {
             doc.add_text(signature_field, sig);
         }
 
-        let writer = self.writer.as_mut().unwrap();
+        let writer = slot.as_mut().unwrap();
         match writer.add_document(doc) {
             Ok(_) => Ok(()),
             Err(e) => {
@@ -360,8 +366,8 @@ impl FtsStore {
                     );
 
                     // Drop the dead writer and recreate
-                    self.writer = None;
-                    self.ensure_writer()?;
+                    *slot = None;
+                    Self::ensure_writer(&self.index, &mut slot)?;
 
                     // Rebuild the document for retry
                     let mut retry_doc = TantivyDocument::new();
@@ -373,7 +379,7 @@ impl FtsStore {
                         retry_doc.add_text(signature_field, sig);
                     }
 
-                    let writer = self.writer.as_mut().unwrap();
+                    let writer = slot.as_mut().unwrap();
                     writer.add_document(retry_doc).map_err(|e| {
                         anyhow!("FTS add_document failed after writer recovery: {}", e)
                     })?;
@@ -386,10 +392,11 @@ impl FtsStore {
     }
 
     /// Delete a chunk by ID
-    pub fn delete_chunk(&mut self, chunk_id: u32) -> Result<()> {
-        self.ensure_writer()?;
+    pub fn delete_chunk(&self, chunk_id: u32) -> Result<()> {
+        let mut slot = self.lock_writer();
+        Self::ensure_writer(&self.index, &mut slot)?;
         let chunk_id_field = self.chunk_id_field;
-        let writer = self.writer.as_mut().unwrap();
+        let writer = slot.as_mut().unwrap();
         let term = Term::from_field_u64(chunk_id_field, chunk_id as u64);
         writer.delete_term(term);
         Ok(())
@@ -397,10 +404,11 @@ impl FtsStore {
 
     /// Delete all chunks for a file path
     #[allow(dead_code)] // Reserved for file-level deletion
-    pub fn delete_by_path(&mut self, path: &str) -> Result<()> {
-        self.ensure_writer()?;
+    pub fn delete_by_path(&self, path: &str) -> Result<()> {
+        let mut slot = self.lock_writer();
+        Self::ensure_writer(&self.index, &mut slot)?;
         let path_field = self.path_field;
-        let writer = self.writer.as_mut().unwrap();
+        let writer = slot.as_mut().unwrap();
         let term = Term::from_field_text(path_field, path);
         writer.delete_term(term);
         Ok(())
@@ -411,8 +419,9 @@ impl FtsStore {
     /// If the writer was killed (background merge panic), it is recreated.
     /// Data since the last successful commit will be lost in that case, but
     /// indexing can continue rather than aborting entirely.
-    pub fn commit(&mut self) -> Result<()> {
-        if self.writer.is_none() {
+    pub fn commit(&self) -> Result<()> {
+        let mut slot = self.lock_writer();
+        if slot.is_none() {
             return Ok(());
         }
 
@@ -425,7 +434,7 @@ impl FtsStore {
                 std::thread::sleep(std::time::Duration::from_millis(100 * (1 << attempt)));
             }
 
-            let writer = self.writer.as_mut().unwrap();
+            let writer = slot.as_mut().unwrap();
             match writer.commit() {
                 Ok(_) => {
                     // Reload reader to see changes
@@ -449,11 +458,11 @@ impl FtsStore {
                             attempt + 1,
                             max_retries
                         );
-                        self.writer = None;
-                        self.ensure_writer()?;
+                        *slot = None;
+                        Self::ensure_writer(&self.index, &mut slot)?;
                         // After recreating, the pending data is gone, so commit
                         // the new (empty) writer to ensure a clean state
-                        if let Some(ref mut w) = self.writer {
+                        if let Some(ref mut w) = *slot {
                             w.commit()
                                 .map_err(|e| anyhow!("FTS commit after recovery failed: {}", e))?;
                         }
@@ -682,9 +691,10 @@ impl FtsStore {
 
     /// Clear the entire index
     #[allow(dead_code)] // Reserved for index reset
-    pub fn clear(&mut self) -> Result<()> {
-        self.ensure_writer()?;
-        let writer = self.writer.as_mut().unwrap();
+    pub fn clear(&self) -> Result<()> {
+        let mut slot = self.lock_writer();
+        Self::ensure_writer(&self.index, &mut slot)?;
+        let writer = slot.as_mut().unwrap();
         writer.delete_all_documents()?;
         writer.commit()?;
         self.reader.reload()?;
@@ -706,7 +716,7 @@ mod tests {
 
     #[test]
     fn test_fts_basic() -> Result<()> {
-        let mut store = FtsStore::new_in_memory()?;
+        let store = FtsStore::new_in_memory()?;
 
         // Add some chunks
         store.add_chunk(
@@ -753,7 +763,7 @@ mod tests {
 
     #[test]
     fn test_fts_delete() -> Result<()> {
-        let mut store = FtsStore::new_in_memory()?;
+        let store = FtsStore::new_in_memory()?;
 
         store.add_chunk(1, "test content one", "file1.rs", None, "block")?;
         store.add_chunk(2, "test content two", "file2.rs", None, "block")?;
@@ -777,7 +787,7 @@ mod tests {
 
     #[test]
     fn test_fts_search_regex() -> Result<()> {
-        let mut store = FtsStore::new_in_memory()?;
+        let store = FtsStore::new_in_memory()?;
 
         store.add_chunk(
             1,
@@ -836,7 +846,7 @@ mod tests {
 
     #[test]
     fn test_fts_search_phrase() -> Result<()> {
-        let mut store = FtsStore::new_in_memory()?;
+        let store = FtsStore::new_in_memory()?;
 
         store.add_chunk(
             1,
@@ -895,7 +905,7 @@ mod tests {
         // an incompatible tantivy major.
         std::fs::write(fts_dir.join("meta.json"), "{ not valid tantivy metadata")?;
 
-        let mut store = FtsStore::new(tmp.path())?;
+        let store = FtsStore::new(tmp.path())?;
 
         // Fresh store: opens and searches empty.
         let results = store.search("anything", 10, None)?;

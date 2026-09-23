@@ -29,7 +29,7 @@ use std::collections::HashSet;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -183,8 +183,10 @@ pub fn release_writer_lock(_lock: File) {
 ///
 /// Uses RwLock to allow multiple concurrent readers (searches) with exclusive writer (indexing).
 pub struct SharedStores {
-    pub vector_store: Arc<RwLock<VectorStore>>,
-    pub fts_store: Arc<RwLock<FtsStore>>,
+    /// Lock-free for readers (LMDB MVCC snapshots); writes serialize inside the store.
+    pub vector_store: Arc<VectorStore>,
+    /// Lock-free for readers (tantivy searcher snapshots); writes serialize inside the store.
+    pub fts_store: Arc<FtsStore>,
     /// Lock file handle (Some = we have writer lock, None = readonly mode)
     #[allow(dead_code)]
     writer_lock: Option<File>,
@@ -226,8 +228,8 @@ impl SharedStores {
         info!("📦 SharedStores created in read-write mode");
 
         Ok(Self {
-            vector_store: Arc::new(RwLock::new(vector_store)),
-            fts_store: Arc::new(RwLock::new(fts_store)),
+            vector_store: Arc::new(vector_store),
+            fts_store: Arc::new(fts_store),
             writer_lock: lock,
             readonly: false,
             changes_count: std::sync::atomic::AtomicU64::new(0),
@@ -245,8 +247,8 @@ impl SharedStores {
         info!("📦 SharedStores created in readonly mode");
 
         Ok(Self {
-            vector_store: Arc::new(RwLock::new(vector_store)),
-            fts_store: Arc::new(RwLock::new(fts_store)),
+            vector_store: Arc::new(vector_store),
+            fts_store: Arc::new(fts_store),
             writer_lock: None,
             readonly: true,
             changes_count: std::sync::atomic::AtomicU64::new(0),
@@ -596,7 +598,7 @@ impl IndexManager {
         // Re-indexing without clearing would create duplicate chunks.
         if file_meta_store.is_empty() {
             let vs_chunks = {
-                let vs = stores.vector_store.read().await;
+                let vs = &stores.vector_store;
                 vs.stats().map(|s| s.total_chunks).unwrap_or(0)
             };
             if vs_chunks > 0 {
@@ -606,11 +608,11 @@ impl IndexManager {
                     vs_chunks
                 );
                 {
-                    let mut vstore = stores.vector_store.write().await;
+                    let vstore = &stores.vector_store;
                     vstore.clear()?;
                 }
                 {
-                    let mut fts = stores.fts_store.write().await;
+                    let fts = &stores.fts_store;
                     fts.clear()?;
                 }
             }
@@ -669,59 +671,24 @@ impl IndexManager {
         // by the model the index was created with (never the hardcoded default).
         let (embed_model, _dims) = Self::resolve_embed_model(db_path)?;
 
-        // Delete chunks for deleted files
+        // Delete chunks for deleted files in one write txn (one incremental
+        // HNSW publish), not one per file.
+        let mut deleted_ids: Vec<u32> = Vec::new();
         for (file_path, chunk_ids) in &deleted_files {
-            if !chunk_ids.is_empty() {
-                debug!("🗑️  Deleting {} chunks for: {}", chunk_ids.len(), file_path);
-
-                // Delete from vector store
-                {
-                    let mut store = stores.vector_store.write().await;
-                    store.delete_chunks(chunk_ids)?;
-                }
-
-                // Delete from FTS
-                {
-                    let mut fts_store = stores.fts_store.write().await;
-                    for chunk_id in chunk_ids {
-                        fts_store.delete_chunk(*chunk_id)?;
-                    }
-                }
-            }
+            debug!("🗑️  Deleting {} chunks for: {}", chunk_ids.len(), file_path);
+            deleted_ids.extend(chunk_ids);
             file_meta_store.remove_file(Path::new(file_path));
         }
-
-        // Delete old chunks for changed files
-        for file in &changed_files {
-            let (_, old_chunk_ids) = file_meta_store.check_file(&file.path)?;
-            if !old_chunk_ids.is_empty() {
-                debug!(
-                    "🔄 Deleting {} old chunks for: {}",
-                    old_chunk_ids.len(),
-                    file.path.display()
-                );
-
-                // Delete from vector store
-                {
-                    let mut store = stores.vector_store.write().await;
-                    store.delete_chunks(&old_chunk_ids)?;
-                }
-
-                // Delete from FTS
-                {
-                    let mut fts_store = stores.fts_store.write().await;
-                    for chunk_id in &old_chunk_ids {
-                        fts_store.delete_chunk(*chunk_id)?;
-                    }
-                }
+        if !deleted_ids.is_empty() {
+            stores.vector_store.delete_chunks(&deleted_ids)?;
+            for chunk_id in &deleted_ids {
+                stores.fts_store.delete_chunk(*chunk_id)?;
             }
+            stores.fts_store.commit()?;
         }
 
-        // Commit FTS deletions
-        {
-            let mut fts_store = stores.fts_store.write().await;
-            fts_store.commit()?;
-        }
+        // Changed files keep their old chunks until their batch below replaces
+        // them atomically, so they stay searchable while the refresh runs.
 
         // Chunk changed files — in bounded batches, not one unbounded pass.
         //
@@ -820,6 +787,11 @@ impl IndexManager {
                 // build_index, so a removed repo never receives fresh data.
                 Self::ensure_indexing_active(cancel_token)?;
 
+                let mut stale_ids: Vec<u32> = Vec::new();
+                for file in file_batch {
+                    stale_ids.extend(file_meta_store.check_file(&file.path)?.1);
+                }
+
                 if !embedded_chunks.is_empty() {
                     info!(
                         "📦 Batch {}/{}: embedding {} chunks with model {}...",
@@ -829,19 +801,20 @@ impl IndexManager {
                         embed_model.short_name()
                     );
 
-                    // Insert into vector store. `build_index()` (HNSW graph
-                    // construction) is deliberately deferred until ALL batches
-                    // are inserted — it rebuilds the whole graph from current
-                    // storage, so doing it once at the end avoids O(batches)
-                    // redundant rebuilds.
-                    let chunk_ids = {
-                        let mut store = stores.vector_store.write().await;
-                        store.insert_chunks_with_ids(embedded_chunks.clone())?
-                    };
+                    // Swap this batch's old chunks for the new ones in one
+                    // write txn. A store that is already serving reads
+                    // publishes an incremental HNSW build in the same txn; a
+                    // fresh store defers the build to the end of the refresh.
+                    let chunk_ids = stores
+                        .vector_store
+                        .replace_chunks(&stale_ids, embedded_chunks.clone())?;
 
-                    // Insert into FTS
+                    // Replace in FTS (one commit per batch)
                     {
-                        let mut fts_store = stores.fts_store.write().await;
+                        let fts_store = &stores.fts_store;
+                        for chunk_id in &stale_ids {
+                            fts_store.delete_chunk(*chunk_id)?;
+                        }
                         for (chunk, chunk_id) in embedded_chunks.iter().zip(chunk_ids.iter()) {
                             let path_str = chunk.chunk.path.to_string();
                             let signature = chunk.chunk.signature.as_deref();
@@ -882,9 +855,16 @@ impl IndexManager {
 
                     total_indexed += embedded_chunks.len();
                 } else {
-                    // ALL files in this batch produced 0 chunks — still track
-                    // them so they are not flagged as unindexed on every
-                    // subsequent run.
+                    // ALL files in this batch produced 0 chunks — drop their
+                    // old chunks and still track them so they are not flagged
+                    // as unindexed on every subsequent run.
+                    if !stale_ids.is_empty() {
+                        stores.vector_store.delete_chunks(&stale_ids)?;
+                        for chunk_id in &stale_ids {
+                            stores.fts_store.delete_chunk(*chunk_id)?;
+                        }
+                        stores.fts_store.commit()?;
+                    }
                     for file in file_batch {
                         file_meta_store.update_file(&file.path, vec![])?;
                     }
@@ -897,7 +877,7 @@ impl IndexManager {
                 Self::ensure_indexing_active(cancel_token)?;
                 let vector_store = Arc::clone(&stores.vector_store);
                 tokio::task::spawn_blocking(move || {
-                    let mut store = vector_store.blocking_write();
+                    let store = &vector_store;
                     store.build_index()
                 })
                 .await
@@ -945,7 +925,7 @@ impl IndexManager {
                 warn!("metadata.json model write warning: {}", e);
             }
 
-            let vs = stores.vector_store.read().await;
+            let vs = &stores.vector_store;
             if let Ok(stats) = vs.stats() {
                 super::update_metadata_stats(db_path, stats.total_chunks, stats.total_files);
             }
@@ -1045,13 +1025,13 @@ impl IndexManager {
 
         // ── Step 1: Clear vector store (LMDB databases) ──
         {
-            let mut vstore = stores.vector_store.write().await;
+            let vstore = &stores.vector_store;
             vstore.clear()?;
         }
 
         // ── Step 2: Clear full-text search store (Tantivy index) ──
         {
-            let mut fts = stores.fts_store.write().await;
+            let fts = &stores.fts_store;
             fts.clear()?;
         }
 
@@ -1942,7 +1922,7 @@ impl IndexManager {
         // index_single_file_with_stores already calls build_index() per file, but when a batch
         // contains ONLY removals (no additions), the index would never be rebuilt without this.
         if !files_to_remove.is_empty() {
-            let mut store = stores.vector_store.write().await;
+            let store = &stores.vector_store;
             store.build_index()?;
         }
 
@@ -1978,7 +1958,7 @@ impl IndexManager {
 
         // Persist chunk/file counts in metadata.json for status(projects)
         {
-            let vs = stores.vector_store.read().await;
+            let vs = &stores.vector_store;
             if let Ok(stats) = vs.stats() {
                 super::update_metadata_stats(db_path, stats.total_chunks, stats.total_files);
             }
@@ -2080,11 +2060,11 @@ impl IndexManager {
             // Batch-delete all stale chunks from both stores
             if !chunks_to_delete.is_empty() {
                 {
-                    let mut vstore = stores.vector_store.write().await;
+                    let vstore = &stores.vector_store;
                     vstore.delete_chunks(&chunks_to_delete)?;
                 }
                 {
-                    let mut fstore = stores.fts_store.write().await;
+                    let fstore = &stores.fts_store;
                     for &chunk_id in &chunks_to_delete {
                         fstore.delete_chunk(chunk_id)?;
                     }
@@ -2107,7 +2087,7 @@ impl IndexManager {
             {
                 let vector_store = Arc::clone(&stores.vector_store);
                 tokio::task::spawn_blocking(move || {
-                    let mut vstore = vector_store.blocking_write();
+                    let vstore = &vector_store;
                     vstore.build_index()
                 })
                 .await
@@ -2118,9 +2098,8 @@ impl IndexManager {
             // FileMetaStore may not track all ghost chunks (from pre-fix indexing runs).
             // Directly scan the VectorStore for chunks referencing files not on disk.
             {
-                let vstore = stores.vector_store.read().await;
+                let vstore = &stores.vector_store;
                 let vs_file_chunks = vstore.get_chunks_by_file()?;
-                drop(vstore); // Release read lock before potential write
 
                 let mut orphan_chunk_ids: Vec<u32> = Vec::new();
                 let mut orphan_file_count = 0usize;
@@ -2142,13 +2121,13 @@ impl IndexManager {
                     // Delete orphan chunks from VectorStore, then rebuild the
                     // HNSW index off the async executor (CPU-heavy).
                     {
-                        let mut vstore = stores.vector_store.write().await;
+                        let vstore = &stores.vector_store;
                         vstore.delete_chunks(&orphan_chunk_ids)?;
                     }
                     {
                         let vector_store = Arc::clone(&stores.vector_store);
                         tokio::task::spawn_blocking(move || {
-                            let mut vstore = vector_store.blocking_write();
+                            let vstore = &vector_store;
                             vstore.build_index()
                         })
                         .await
@@ -2157,7 +2136,7 @@ impl IndexManager {
 
                     // Delete orphan chunks from FtsStore
                     {
-                        let mut fstore = stores.fts_store.write().await;
+                        let fstore = &stores.fts_store;
                         for &cid in &orphan_chunk_ids {
                             let _ = fstore.delete_chunk(cid);
                         }
@@ -2333,54 +2312,33 @@ impl IndexManager {
             EmbeddingService::with_cache_dir(embed_model, Some(cache_dir.as_path()))?;
         let embedded_chunks = embedding_service.embed_chunks(chunks)?;
 
-        // ── Delete stale chunks for this file BEFORE inserting new ones ──
-        // When a file is re-indexed (e.g. after a content change), the old
-        // chunk_ids must be removed from both VectorStore and FTSStore to
-        // prevent orphaned duplicates.  FileMetaStore.remove_file gives us
-        // the previous chunk_ids (if any) and atomically clears them so that
-        // update_file below can store the fresh set.
-        {
-            let mut file_meta_store =
-                FileMetaStore::load_or_create(&db_path, model_name, dimensions)?;
-            if let Some(old_meta) = file_meta_store.remove_file(file_path) {
-                let old_ids = old_meta.chunk_ids;
-                if !old_ids.is_empty() {
-                    debug!(
-                        "Removing {} stale chunks before re-index: {}",
-                        old_ids.len(),
-                        file_path.display()
-                    );
-                    // Vector store — batch delete
-                    {
-                        let mut store = stores.vector_store.write().await;
-                        store.delete_chunks(&old_ids)?;
-                    }
-                    // FTS store — per-chunk delete + commit
-                    {
-                        let mut fts_store = stores.fts_store.write().await;
-                        for id in &old_ids {
-                            fts_store.delete_chunk(*id)?;
-                        }
-                        fts_store.commit()?;
-                    }
-                }
-                // Persist the removal so the stale ids are gone from metadata
-                file_meta_store.save(&db_path)?;
-            }
+        // Swap the file's previous chunks for the new ones in one write txn so
+        // readers never see the file missing or duplicated. `remove_file`
+        // hands back the previous chunk ids (if any).
+        let mut file_meta_store = FileMetaStore::load_or_create(&db_path, model_name, dimensions)?;
+        let old_ids = file_meta_store
+            .remove_file(file_path)
+            .map(|meta| meta.chunk_ids)
+            .unwrap_or_default();
+        if !old_ids.is_empty() {
+            debug!(
+                "Replacing {} stale chunks: {}",
+                old_ids.len(),
+                file_path.display()
+            );
         }
+        let chunk_ids = stores
+            .vector_store
+            .replace_chunks(&old_ids, embedded_chunks.clone())?;
+        // No-op when the store already serves reads (the replace published the
+        // graph); builds a first graph for a store that has none yet.
+        stores.vector_store.build_index()?;
 
-        // Use shared stores with write lock
-        let chunk_ids = {
-            let mut store = stores.vector_store.write().await;
-            let chunk_ids = store.insert_chunks_with_ids(embedded_chunks.clone())?;
-            // Rebuild the vector index after inserting new chunks
-            store.build_index()?;
-            chunk_ids
-        };
-
-        // Add to FTS with write lock
         {
-            let mut fts_store = stores.fts_store.write().await;
+            let fts_store = &stores.fts_store;
+            for id in &old_ids {
+                fts_store.delete_chunk(*id)?;
+            }
             for (chunk, chunk_id) in embedded_chunks.iter().zip(chunk_ids.iter()) {
                 let path_str = chunk.chunk.path.to_string();
                 let signature = chunk.chunk.signature.as_deref();
@@ -2396,8 +2354,6 @@ impl IndexManager {
             fts_store.commit()?;
         }
 
-        // Update file metadata (separate store, not shared)
-        let mut file_meta_store = FileMetaStore::load_or_create(&db_path, model_name, dimensions)?;
         file_meta_store.update_file(file_path, chunk_ids)?;
         file_meta_store.save(&db_path)?;
 
@@ -2458,17 +2414,11 @@ impl IndexManager {
             file_path.display()
         );
 
-        // Delete chunks from vector store with write lock
-        {
-            let mut store = stores.vector_store.write().await;
-            for chunk_id in &chunk_ids {
-                store.delete_chunks(&[*chunk_id])?;
-            }
-        }
+        stores.vector_store.delete_chunks(&chunk_ids)?;
 
         // Delete from FTS with write lock
         {
-            let mut fts_store = stores.fts_store.write().await;
+            let fts_store = &stores.fts_store;
             for chunk_id in &chunk_ids {
                 fts_store.delete_chunk(*chunk_id)?;
             }
@@ -2542,8 +2492,8 @@ mod tests {
         use crate::vectordb::VectorStore;
 
         SharedStores {
-            vector_store: Arc::new(RwLock::new(VectorStore::new(db_path, dimensions).unwrap())),
-            fts_store: Arc::new(RwLock::new(FtsStore::new_with_writer(db_path).unwrap())),
+            vector_store: Arc::new(VectorStore::new(db_path, dimensions).unwrap()),
+            fts_store: Arc::new(FtsStore::new_with_writer(db_path).unwrap()),
             writer_lock: None,
             readonly: false,
             changes_count: std::sync::atomic::AtomicU64::new(0),

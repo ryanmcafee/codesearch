@@ -107,7 +107,7 @@ impl CodesearchService {
                 let mut candidates: Vec<(&Arc<SharedStores>, String)> = Vec::new();
                 let aliases = ctx.aliases();
                 for (i, store_arc) in sv.iter().enumerate() {
-                    let store = store_arc.vector_store.read().await;
+                    let store = &store_arc.vector_store;
                     match store.get_chunk(request.chunk_id) {
                         Ok(Some(_)) => {
                             // A store that HAS the chunk stays a candidate even if
@@ -153,7 +153,7 @@ impl CodesearchService {
                             serve_state.record_tool_call(alias, "get_chunk");
                             serve_state.touch_access(alias);
                         }
-                        let store = store_arc.vector_store.read().await;
+                        let store = &store_arc.vector_store;
                         match store.get_chunk(request.chunk_id) {
                             Ok(c) => c,
                             Err(ref e) => {
@@ -188,7 +188,7 @@ impl CodesearchService {
                 let aliases = ctx.aliases();
                 let mut found = None;
                 for (i, store_arc) in sv.iter().enumerate() {
-                    let store = store_arc.vector_store.read().await;
+                    let store = &store_arc.vector_store;
                     match store.get_chunk(request.chunk_id) {
                         Ok(Some(c)) => {
                             found = Some(c);

@@ -22,6 +22,8 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::num::NonZeroUsize;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard};
 use tracing::{error, warn};
 
 /// Read the persisted LMDB map size from metadata.json in the database directory.
@@ -394,10 +396,21 @@ pub struct VectorStore {
     /// then silently returns the wrong file. The mark never decreases on
     /// delete; deleted ids stay dead forever (safe `Ok(None)` misses).
     id_hwm_db: Option<Database<Str, SerdeBincode<u32>>>,
-    next_id: u32,
     dimensions: usize,
-    indexed: bool,
-    pub map_size_mb: usize,
+    /// Serializes mutations (single writer). Readers never take it: LMDB MVCC
+    /// gives every read txn the last committed snapshot.
+    writer: Mutex<WriterState>,
+    /// Whether the committed snapshot has a built HNSW graph. Once true, every
+    /// mutation builds inside its own write txn, so readers never see NeedBuild.
+    indexed: AtomicBool,
+    map_size_mb: AtomicUsize,
+    /// Readers hold this shared for the life of a read txn; `resize_environment`
+    /// takes it exclusively because LMDB forbids resizing with a live txn.
+    resize_gate: RwLock<()>,
+}
+
+struct WriterState {
+    next_id: u32,
 }
 
 /// Key in the "meta" database holding the highest chunk id ever assigned.
@@ -525,10 +538,11 @@ impl VectorStore {
             vectors,
             chunks,
             id_hwm_db: Some(id_hwm_db),
-            next_id,
             dimensions,
-            indexed,
-            map_size_mb,
+            writer: Mutex::new(WriterState { next_id }),
+            indexed: AtomicBool::new(indexed),
+            map_size_mb: AtomicUsize::new(map_size_mb),
+            resize_gate: RwLock::new(()),
         })
     }
 
@@ -635,15 +649,58 @@ impl VectorStore {
             vectors,
             chunks,
             id_hwm_db,
-            next_id,
             dimensions,
-            indexed,
-            map_size_mb,
+            writer: Mutex::new(WriterState { next_id }),
+            indexed: AtomicBool::new(indexed),
+            map_size_mb: AtomicUsize::new(map_size_mb),
+            resize_gate: RwLock::new(()),
         })
     }
 
     /// Check if an error is an MDB_MAP_FULL error
     /// MDB_MAP_FULL error code is -28
+    fn read_gate(&self) -> RwLockReadGuard<'_, ()> {
+        self.resize_gate.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn lock_writer(&self) -> MutexGuard<'_, WriterState> {
+        self.writer.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Current LMDB map size in MB (grows on MDB_MAP_FULL).
+    pub fn map_size_mb(&self) -> usize {
+        self.map_size_mb.load(Ordering::Acquire)
+    }
+
+    /// Next chunk id the writer will hand out.
+    #[cfg(test)]
+    pub(crate) fn next_id(&self) -> u32 {
+        self.lock_writer().next_id
+    }
+
+    /// Build the HNSW graph inside `wtxn` when the store is serving reads, so
+    /// the commit publishes data and index together (arroy builds incrementally).
+    fn publish_if_indexed(&self, wtxn: &mut heed::RwTxn<'_>) -> Result<()> {
+        if self.indexed.load(Ordering::Acquire) {
+            let writer = Writer::new(self.vectors, 0, self.dimensions);
+            let mut rng = StdRng::seed_from_u64(rand::random());
+            writer.builder(&mut rng).build(wtxn)?;
+        }
+        Ok(())
+    }
+
+    /// Test hook: hold the writer lock and an uncommitted write txn while `f` runs.
+    #[cfg(test)]
+    pub(crate) fn with_open_write_txn_for_test(&self, f: impl FnOnce()) -> Result<()> {
+        let _writer = self.lock_writer();
+        let mut wtxn = self.env.write_txn()?;
+        let writer = Writer::new(self.vectors, 0, self.dimensions);
+        writer.add_item(&mut wtxn, u32::MAX - 1, &vec![0.5; self.dimensions])?;
+        f();
+        drop(wtxn);
+        Ok(())
+    }
+
     fn is_map_full_error(&self, error: &dyn std::error::Error) -> bool {
         // MDB_MAP_FULL error code is -28 (0xFFFFFFE4)
         error.to_string().contains("MDB_MAP_FULL") || error.to_string().contains("map full")
@@ -655,7 +712,7 @@ impl VectorStore {
     /// hood.  This resizes in-place without closing and reopening the
     /// environment, which avoids the "an environment is already opened with
     /// different options" error when a live serve process needs to grow the map.
-    fn resize_environment(&mut self, new_size_mb: usize) -> Result<()> {
+    fn resize_environment(&self, new_size_mb: usize) -> Result<()> {
         if new_size_mb > max_lmdb_map_size_mb() {
             return Err(anyhow::anyhow!(
                 "Requested map size {}MB exceeds MAX_LMDB_MAP_SIZE_MB {}MB \
@@ -669,19 +726,18 @@ impl VectorStore {
 
         tracing::warn!("🔧 Resizing LMDB environment to {}MB", new_size_mb);
 
-        // SAFETY: mdb_env_set_mapsize() is safe to call when no transaction is
-        // active.  Our caller holds &mut self and just got MDB_MAP_FULL on an
-        // insert — any write transaction that triggered the error has already
-        // been dropped by the caller before invoking the retry logic.
-        // The `&mut self` covers this store only: LMDB requires no *process*
-        // transaction to be live, which holds because every reader of this
-        // path goes through the same `RwLock<VectorStore>` (shared env via
-        // `lmdb_registry`) and is therefore excluded by our write lock.
-        unsafe {
-            self.env.resize(new_size_bytes)?;
+        // SAFETY: mdb_env_set_mapsize() requires that no transaction is live in
+        // this process. Callers hold the writer lock (no other write txn) and
+        // have dropped the txn that hit MDB_MAP_FULL; the exclusive
+        // `resize_gate` waits out every in-flight read txn and blocks new ones.
+        {
+            let _exclusive = self.resize_gate.write().unwrap_or_else(|e| e.into_inner());
+            unsafe {
+                self.env.resize(new_size_bytes)?;
+            }
         }
 
-        self.map_size_mb = new_size_mb;
+        self.map_size_mb.store(new_size_mb, Ordering::Release);
 
         // Raise the process-global per-path pin so any later reopen of this path
         // (e.g. after idle eviction) resolves to the grown size and matches the
@@ -707,18 +763,19 @@ impl VectorStore {
     ///
     /// Returns the number of chunks inserted
     #[allow(dead_code)] // Reserved for batch insert operations
-    pub fn insert_chunks(&mut self, chunks: Vec<EmbeddedChunk>) -> Result<usize> {
+    pub fn insert_chunks(&self, chunks: Vec<EmbeddedChunk>) -> Result<usize> {
         if chunks.is_empty() {
             return Ok(0);
         }
 
         info_print!("📊 Inserting {} chunks...", chunks.len());
 
+        let mut w = self.lock_writer();
         let mut wtxn = self.env.write_txn()?;
         let writer = Writer::new(self.vectors, 0, self.dimensions);
 
         for chunk in &chunks {
-            let id = self.next_id;
+            let id = w.next_id;
 
             // Check embedding dimensions
             if chunk.embedding.len() != self.dimensions {
@@ -736,24 +793,22 @@ impl VectorStore {
             let metadata = ChunkMetadata::from_embedded_chunk(chunk);
             self.chunks.put(&mut wtxn, &id, &metadata)?;
 
-            self.next_id += 1;
+            w.next_id += 1;
         }
 
         // Same-transaction mark persist as in insert_chunks_with_ids_impl.
         if let Some(db) = &self.id_hwm_db {
-            db.put(&mut wtxn, META_KEY_ID_HWM, &(self.next_id - 1))?;
+            db.put(&mut wtxn, META_KEY_ID_HWM, &(w.next_id - 1))?;
         }
 
+        self.publish_if_indexed(&mut wtxn)?;
         wtxn.commit()?;
-
-        // Mark as not indexed (need to rebuild index after inserts)
-        self.indexed = false;
 
         info_print!(
             "✅ Inserted {} chunks (IDs: {}-{})",
             chunks.len(),
-            self.next_id - chunks.len() as u32,
-            self.next_id - 1
+            w.next_id - chunks.len() as u32,
+            w.next_id - 1
         );
 
         Ok(chunks.len())
@@ -764,7 +819,8 @@ impl VectorStore {
     /// Must be called after inserting chunks and before searching.
     /// This is the heaviest LMDB write operation (arroy tree build),
     /// so it includes retry logic for MDB_MAP_FULL errors.
-    pub fn build_index(&mut self) -> Result<()> {
+    pub fn build_index(&self) -> Result<()> {
+        let _w = self.lock_writer();
         let mut attempts = 0;
         let max_attempts = 3;
 
@@ -783,12 +839,14 @@ impl VectorStore {
                         error!(
                             "❌ MDB_MAP_FULL persists in build_index() after {} attempt(s) at \
                              {}MB — giving up: {}",
-                            attempts, self.map_size_mb, e
+                            attempts,
+                            self.map_size_mb(),
+                            e
                         );
                         return result;
                     }
 
-                    let new_size = self.map_size_mb * 2;
+                    let new_size = self.map_size_mb() * 2;
                     if new_size <= max_lmdb_map_size_mb() {
                         warn!(
                             "MDB_MAP_FULL error in build_index(), resizing to {}MB (attempt {}/{})",
@@ -797,7 +855,7 @@ impl VectorStore {
                         self.resize_environment(new_size)?;
                         warn!(
                             "↻ Retrying build_index() at {}MB (attempt {}/{})",
-                            self.map_size_mb,
+                            self.map_size_mb(),
                             attempts + 1,
                             max_attempts
                         );
@@ -805,7 +863,7 @@ impl VectorStore {
                         warn!(
                             "MDB_MAP_FULL error in build_index(), already at max size {}MB \
                              (set CODESEARCH_MAX_LMDB_MAP_SIZE_MB to raise this cap)",
-                            self.map_size_mb
+                            self.map_size_mb()
                         );
                         return result;
                     }
@@ -815,13 +873,20 @@ impl VectorStore {
     }
 
     /// Implementation of build_index without retry logic
-    fn build_index_impl(&mut self) -> Result<()> {
-        let mut wtxn = self.env.write_txn()?;
+    /// Caller holds the writer lock.
+    fn build_index_impl(&self) -> Result<()> {
         let writer = Writer::new(self.vectors, 0, self.dimensions);
+        if self.indexed.load(Ordering::Acquire) {
+            let rtxn = self.env.read_txn()?;
+            if !writer.need_build(&rtxn)? {
+                return Ok(());
+            }
+        }
+        let mut wtxn = self.env.write_txn()?;
         let mut rng = StdRng::seed_from_u64(rand::random());
         writer.builder(&mut rng).build(&mut wtxn)?;
         wtxn.commit()?;
-        self.indexed = true;
+        self.indexed.store(true, Ordering::Release);
         Ok(())
     }
     pub fn search(&self, query_embedding: &[f32], limit: usize) -> Result<Vec<SearchResult>> {
@@ -833,12 +898,13 @@ impl VectorStore {
             ));
         }
 
-        if !self.indexed {
+        if !self.indexed.load(Ordering::Acquire) {
             return Err(anyhow!(
                 "Index not built. Call build_index() after inserting chunks."
             ));
         }
 
+        let _gate = self.read_gate();
         let rtxn = self.env.read_txn()?;
         let reader = Reader::open(&rtxn, 0, self.vectors)?;
 
@@ -904,12 +970,14 @@ impl VectorStore {
     /// plain field. This matters on the memory/CPU-constrained serve replica,
     /// where the read-only warmup path exists precisely to do almost no work.
     pub fn index_health(&self) -> Result<(usize, bool)> {
+        let _gate = self.read_gate();
         let rtxn = self.env.read_txn()?;
         let total_chunks = self.chunks.len(&rtxn)? as usize;
-        Ok((total_chunks, self.indexed))
+        Ok((total_chunks, self.indexed.load(Ordering::Acquire)))
     }
 
     pub fn stats(&self) -> Result<StoreStats> {
+        let _gate = self.read_gate();
         let rtxn = self.env.read_txn()?;
 
         let total_chunks = self.chunks.len(&rtxn)?;
@@ -927,7 +995,7 @@ impl VectorStore {
         Ok(StoreStats {
             total_chunks: total_chunks as usize,
             total_files: unique_files.len(),
-            indexed: self.indexed,
+            indexed: self.indexed.load(Ordering::Acquire),
             dimensions: self.dimensions,
             max_chunk_id,
         })
@@ -941,6 +1009,7 @@ impl VectorStore {
     /// Used by the scan-path fallback for tokenless regex queries where BM25
     /// cannot produce useful candidates.
     pub fn iter_all_chunks(&self) -> Result<Vec<(u32, ChunkMetadata)>> {
+        let _gate = self.read_gate();
         let rtxn = self.env.read_txn()?;
         let mut all = Vec::new();
         for result in self.chunks.iter(&rtxn)? {
@@ -950,6 +1019,7 @@ impl VectorStore {
     }
 
     pub fn get_chunks_by_file(&self) -> Result<std::collections::HashMap<String, Vec<u32>>> {
+        let _gate = self.read_gate();
         let rtxn = self.env.read_txn()?;
         let mut file_chunks: std::collections::HashMap<String, Vec<u32>> =
             std::collections::HashMap::new();
@@ -968,98 +1038,47 @@ impl VectorStore {
     /// Delete chunks by their IDs
     ///
     /// Returns the number of chunks deleted
-    pub fn delete_chunks(&mut self, chunk_ids: &[u32]) -> Result<usize> {
-        // Auto-resize retry logic for MDB_MAP_FULL errors
-        let mut attempts = 0;
-        let max_attempts = 3;
-
-        loop {
-            attempts += 1;
-
-            let result = self.delete_chunks_impl(chunk_ids);
-
-            match &result {
-                Ok(_) => return result,
-                Err(e) => {
-                    if !self.is_map_full_error(e.as_ref()) {
-                        return result;
-                    }
-                    if attempts >= max_attempts {
-                        error!(
-                            "❌ MDB_MAP_FULL persists in delete_chunks() after {} attempt(s) at \
-                             {}MB while deleting {} chunk(s) — giving up: {}",
-                            attempts,
-                            self.map_size_mb,
-                            chunk_ids.len(),
-                            e
-                        );
-                        return result;
-                    }
-
-                    // Double map size and retry
-                    let new_size = self.map_size_mb * 2;
-                    if new_size <= max_lmdb_map_size_mb() {
-                        warn!("MDB_MAP_FULL error in delete_chunks() deleting {} chunk(s), resizing to {}MB (attempt {}/{})",
-                              chunk_ids.len(), new_size, attempts, max_attempts);
-                        self.resize_environment(new_size)?;
-                        warn!(
-                            "↻ Retrying delete of {} chunk(s) at {}MB (attempt {}/{})",
-                            chunk_ids.len(),
-                            self.map_size_mb,
-                            attempts + 1,
-                            max_attempts
-                        );
-                    } else {
-                        error!(
-                            "❌ MDB_MAP_FULL deleting {} chunk(s), already at the max map size \
-                             {}MB (set CODESEARCH_MAX_LMDB_MAP_SIZE_MB to raise this cap)",
-                            chunk_ids.len(),
-                            self.map_size_mb
-                        );
-                        return result;
-                    }
-                }
-            }
-        }
-    }
-
-    /// Implementation of delete_chunks without retry logic
-    fn delete_chunks_impl(&mut self, chunk_ids: &[u32]) -> Result<usize> {
+    pub fn delete_chunks(&self, chunk_ids: &[u32]) -> Result<usize> {
         if chunk_ids.is_empty() {
             return Ok(0);
         }
-
-        let mut wtxn = self.env.write_txn()?;
-        let writer = Writer::new(self.vectors, 0, self.dimensions);
-
-        let mut deleted = 0;
-        for &id in chunk_ids {
-            // Delete from vector database
-            if writer.del_item(&mut wtxn, id).is_ok() {
-                deleted += 1;
-            }
-            // Delete from metadata
-            self.chunks.delete(&mut wtxn, &id)?;
-        }
-
-        wtxn.commit()?;
-
-        // Mark as needing re-index
-        if deleted > 0 {
-            self.indexed = false;
-        }
-
-        Ok(deleted)
+        self.apply_with_retry(chunk_ids, &[])
+            .map(|(deleted, _)| deleted)
     }
 
-    /// Delete all chunks from a specific file
-    ///
-    /// Returns the IDs of deleted chunks
     /// Insert chunks and return their assigned IDs
     ///
     /// Useful for tracking which chunks belong to which file
-    pub fn insert_chunks_with_ids(&mut self, chunks: Vec<EmbeddedChunk>) -> Result<Vec<u32>> {
-        // Auto-resize retry logic for MDB_MAP_FULL errors
+    pub fn insert_chunks_with_ids(&self, chunks: Vec<EmbeddedChunk>) -> Result<Vec<u32>> {
+        if chunks.is_empty() {
+            return Ok(vec![]);
+        }
+        self.apply_with_retry(&[], &chunks).map(|(_, ids)| ids)
+    }
+
+    /// Delete `stale_ids` and insert `chunks` in ONE write txn, so readers see
+    /// either the old chunks or the new ones, never a gap.
+    ///
+    /// Returns the ids assigned to `chunks`.
+    pub fn replace_chunks(
+        &self,
+        stale_ids: &[u32],
+        chunks: Vec<EmbeddedChunk>,
+    ) -> Result<Vec<u32>> {
+        if stale_ids.is_empty() && chunks.is_empty() {
+            return Ok(vec![]);
+        }
+        self.apply_with_retry(stale_ids, &chunks)
+            .map(|(_, ids)| ids)
+    }
+
+    /// Run [`Self::apply_impl`] under the writer lock with MDB_MAP_FULL auto-resize.
+    fn apply_with_retry(
+        &self,
+        stale_ids: &[u32],
+        chunks: &[EmbeddedChunk],
+    ) -> Result<(usize, Vec<u32>)> {
+        let mut w = self.lock_writer();
         let mut attempts = 0;
         let max_attempts = 3;
 
@@ -1069,70 +1088,82 @@ impl VectorStore {
             // The aborted attempt committed nothing, so the ids it consumed
             // were never assigned: hand them back instead of letting every
             // retry push the id space (and arroy's item range) further out.
-            let id_before = self.next_id;
-            let result = self.insert_chunks_with_ids_impl(&chunks);
+            let id_before = w.next_id;
+            let result = self.apply_impl(&mut w, stale_ids, chunks);
 
-            match &result {
-                Ok(_) => return result,
-                Err(e) => {
-                    self.next_id = id_before;
-                    if !self.is_map_full_error(e.as_ref()) {
-                        return result;
-                    }
-                    if attempts >= max_attempts {
-                        // Previously this returned in silence, which is how a
-                        // wedged final attempt looked identical to a crash.
-                        tracing::error!(
-                            "❌ MDB_MAP_FULL persists after {} attempt(s) at {}MB while inserting \
-                             {} chunk(s) — giving up: {}",
-                            attempts,
-                            self.map_size_mb,
-                            chunks.len(),
-                            e
-                        );
-                        return result;
-                    }
-
-                    // Double map size and retry
-                    let new_size = self.map_size_mb * 2;
-                    if new_size <= max_lmdb_map_size_mb() {
-                        warn!("MDB_MAP_FULL error in insert_chunks_with_ids() inserting {} chunk(s), resizing to {}MB (attempt {}/{})",
-                              chunks.len(), new_size, attempts, max_attempts);
-                        self.resize_environment(new_size)?;
-                        warn!(
-                            "↻ Retrying insert of {} chunk(s) at {}MB (attempt {}/{})",
-                            chunks.len(),
-                            self.map_size_mb,
-                            attempts + 1,
-                            max_attempts
-                        );
-                    } else {
-                        error!(
-                            "❌ MDB_MAP_FULL inserting {} chunk(s), already at the max map size \
-                             {}MB (set CODESEARCH_MAX_LMDB_MAP_SIZE_MB to raise this cap)",
-                            chunks.len(),
-                            self.map_size_mb
-                        );
-                        return result;
-                    }
-                }
+            let e = match result {
+                Ok(done) => return Ok(done),
+                Err(e) => e,
+            };
+            w.next_id = id_before;
+            if !self.is_map_full_error(e.as_ref()) {
+                return Err(e);
             }
+            if attempts >= max_attempts {
+                // Previously this returned in silence, which is how a
+                // wedged final attempt looked identical to a crash.
+                error!(
+                    "❌ MDB_MAP_FULL persists after {} attempt(s) at {}MB while deleting {} and \
+                     inserting {} chunk(s) — giving up: {}",
+                    attempts,
+                    self.map_size_mb(),
+                    stale_ids.len(),
+                    chunks.len(),
+                    e
+                );
+                return Err(e);
+            }
+
+            // Double map size and retry
+            let new_size = self.map_size_mb() * 2;
+            if new_size > max_lmdb_map_size_mb() {
+                error!(
+                    "❌ MDB_MAP_FULL deleting {} and inserting {} chunk(s), already at the max \
+                     map size {}MB (set CODESEARCH_MAX_LMDB_MAP_SIZE_MB to raise this cap)",
+                    stale_ids.len(),
+                    chunks.len(),
+                    self.map_size_mb()
+                );
+                return Err(e);
+            }
+            warn!(
+                "MDB_MAP_FULL deleting {} and inserting {} chunk(s), resizing to {}MB (attempt {}/{})",
+                stale_ids.len(),
+                chunks.len(),
+                new_size,
+                attempts,
+                max_attempts
+            );
+            self.resize_environment(new_size)?;
+            warn!(
+                "↻ Retrying at {}MB (attempt {}/{})",
+                self.map_size_mb(),
+                attempts + 1,
+                max_attempts
+            );
         }
     }
 
-    /// Implementation of insert_chunks_with_ids without retry logic
-    fn insert_chunks_with_ids_impl(&mut self, chunks: &[EmbeddedChunk]) -> Result<Vec<u32>> {
-        if chunks.is_empty() {
-            return Ok(vec![]);
-        }
-
-        let start_id = self.next_id;
+    /// One write txn: delete, insert, then publish (build) if the store is serving reads.
+    fn apply_impl(
+        &self,
+        w: &mut WriterState,
+        stale_ids: &[u32],
+        chunks: &[EmbeddedChunk],
+    ) -> Result<(usize, Vec<u32>)> {
         let mut wtxn = self.env.write_txn()?;
         let writer = Writer::new(self.vectors, 0, self.dimensions);
 
-        for chunk in chunks {
-            let id = self.next_id;
+        let mut deleted = 0;
+        for &id in stale_ids {
+            if writer.del_item(&mut wtxn, id).is_ok() {
+                deleted += 1;
+            }
+            self.chunks.delete(&mut wtxn, &id)?;
+        }
 
+        let start_id = w.next_id;
+        for chunk in chunks {
             if chunk.embedding.len() != self.dimensions {
                 return Err(anyhow!(
                     "Embedding dimension mismatch: expected {}, got {}",
@@ -1140,35 +1171,34 @@ impl VectorStore {
                     chunk.embedding.len()
                 ));
             }
-
+            let id = w.next_id;
             writer.add_item(&mut wtxn, id, &chunk.embedding)?;
             let metadata = ChunkMetadata::from_embedded_chunk(chunk);
             self.chunks.put(&mut wtxn, &id, &metadata)?;
-
-            self.next_id += 1;
+            w.next_id += 1;
         }
 
         // Persist the high-water mark in the SAME transaction as the data:
         // if this txn aborts, neither the chunks nor the mark land, so the
-        // mark can never claim ids that were not actually assigned. On
-        // abort the in-memory next_id may have advanced past the persisted
-        // mark — that only wastes ids (gaps), it can never reuse one.
-        if let Some(db) = &self.id_hwm_db {
-            db.put(&mut wtxn, META_KEY_ID_HWM, &(self.next_id - 1))?;
+        // mark can never claim ids that were not actually assigned.
+        if !chunks.is_empty() {
+            if let Some(db) = &self.id_hwm_db {
+                db.put(&mut wtxn, META_KEY_ID_HWM, &(w.next_id - 1))?;
+            }
         }
 
+        self.publish_if_indexed(&mut wtxn)?;
         wtxn.commit()?;
-        self.indexed = false;
 
-        let ids: Vec<u32> = (start_id..self.next_id).collect();
-        Ok(ids)
+        Ok((deleted, (start_id..w.next_id).collect()))
     }
 
     /// Clear all data from the database
     #[allow(dead_code)] // Reserved for database reset operations
-    pub fn clear(&mut self) -> Result<()> {
+    pub fn clear(&self) -> Result<()> {
         info_print!("🗑️  Clearing database...");
 
+        let mut w = self.lock_writer();
         let mut wtxn = self.env.write_txn()?;
 
         // Clear both databases
@@ -1185,8 +1215,8 @@ impl VectorStore {
 
         wtxn.commit()?;
 
-        self.next_id = 0;
-        self.indexed = false;
+        w.next_id = 0;
+        self.indexed.store(false, Ordering::Release);
 
         info_print!("✅ Database cleared");
         Ok(())
@@ -1194,6 +1224,7 @@ impl VectorStore {
 
     /// Get a chunk by ID
     pub fn get_chunk(&self, id: u32) -> Result<Option<ChunkMetadata>> {
+        let _gate = self.read_gate();
         let rtxn = self.env.read_txn()?;
         Ok(self.chunks.get(&rtxn, &id)?)
     }
@@ -1218,6 +1249,7 @@ impl VectorStore {
     pub fn chunks_for_file(&self, path: &str) -> Result<Vec<ChunkMeta>> {
         use std::collections::HashMap;
 
+        let _gate = self.read_gate();
         let rtxn = self.env.read_txn()?;
         let needle = crate::cache::normalize_path_str(path);
         // Two maps: one keyed by signature (for named chunks), one by line
@@ -1268,6 +1300,7 @@ impl VectorStore {
 
     /// Get the stored embedding vector for a chunk id.
     pub fn get_embedding(&self, id: u32) -> Result<Option<Vec<f32>>> {
+        let _gate = self.read_gate();
         let rtxn = self.env.read_txn()?;
         let reader = Reader::open(&rtxn, 0, self.vectors)?;
         let vector = reader.item_vector(&rtxn, id)?;
@@ -1276,6 +1309,7 @@ impl VectorStore {
 
     /// Get a chunk as SearchResult (for hybrid search)
     pub fn get_chunk_as_result(&self, id: u32) -> Result<Option<SearchResult>> {
+        let _gate = self.read_gate();
         let rtxn = self.env.read_txn()?;
         if let Some(meta) = self.chunks.get(&rtxn, &id)? {
             Ok(Some(SearchResult {
@@ -1309,7 +1343,7 @@ impl VectorStore {
     /// Check if the index is built
     #[allow(dead_code)]
     pub fn is_indexed(&self) -> bool {
-        self.indexed
+        self.indexed.load(Ordering::Acquire)
     }
 }
 
@@ -1404,12 +1438,12 @@ mod tests {
     fn a_failed_insert_hands_back_the_ids_it_consumed() {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("ids.db");
-        let mut store = VectorStore::new(&db_path, 4).unwrap();
+        let store = VectorStore::new(&db_path, 4).unwrap();
 
         store
             .insert_chunks_with_ids(vec![drift_chunk("src/a.rs", "fn a() {}", 0)])
             .expect("baseline insert");
-        let before = store.next_id;
+        let before = store.next_id();
 
         let bad = vec![
             drift_chunk("src/b.rs", "fn b() {}", 1),
@@ -1429,7 +1463,8 @@ mod tests {
             .expect_err("dimension mismatch must fail the insert");
 
         assert_eq!(
-            store.next_id, before,
+            store.next_id(),
+            before,
             "ids consumed by the aborted attempt must be handed back"
         );
     }
@@ -1492,7 +1527,7 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("test.db");
 
-        let mut store = VectorStore::new(&db_path, 4).unwrap();
+        let store = VectorStore::new(&db_path, 4).unwrap();
 
         // Create test chunks with different embeddings
         let chunks = vec![
@@ -1541,7 +1576,7 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("test.db");
 
-        let mut store = VectorStore::new(&db_path, 4).unwrap();
+        let store = VectorStore::new(&db_path, 4).unwrap();
 
         let chunks = vec![
             EmbeddedChunk::new(
@@ -1581,7 +1616,7 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("test.db");
 
-        let mut store = VectorStore::new(&db_path, 4).unwrap();
+        let store = VectorStore::new(&db_path, 4).unwrap();
 
         let chunks = vec![EmbeddedChunk::new(
             Chunk::new(
@@ -1612,7 +1647,7 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("test.db");
 
-        let mut store = VectorStore::new(&db_path, 4).unwrap();
+        let store = VectorStore::new(&db_path, 4).unwrap();
 
         let chunks = vec![EmbeddedChunk::new(
             Chunk::new(
@@ -1642,7 +1677,7 @@ mod tests {
 
         // First session: insert and close
         {
-            let mut store = VectorStore::new(&db_path, 4).unwrap();
+            let store = VectorStore::new(&db_path, 4).unwrap();
 
             let chunks = vec![EmbeddedChunk::new(
                 Chunk::new(
@@ -1676,7 +1711,7 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("test.db");
 
-        let mut store = VectorStore::new(&db_path, 4).unwrap();
+        let store = VectorStore::new(&db_path, 4).unwrap();
         let chunks = vec![
             EmbeddedChunk::new(
                 Chunk::new(
@@ -1722,7 +1757,7 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("test.db");
 
-        let mut store = VectorStore::new(&db_path, 4).unwrap();
+        let store = VectorStore::new(&db_path, 4).unwrap();
         let chunks = vec![EmbeddedChunk::new(
             Chunk::new(
                 "fn emb() {}".to_string(),
@@ -1744,7 +1779,7 @@ mod tests {
 
     /// Helper: a 1-chunk insert carrying a distinguishing path, returning the
     /// id assigned to it.
-    fn insert_one(store: &mut VectorStore, path: &str) -> u32 {
+    fn insert_one(store: &VectorStore, path: &str) -> u32 {
         let ids = store
             .insert_chunks_with_ids(vec![EmbeddedChunk::new(
                 Chunk::new(
@@ -1772,9 +1807,9 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("hwm-top.db");
 
-        let mut store = VectorStore::new(&db_path, 4).unwrap();
-        assert_eq!(insert_one(&mut store, "gen1/a.rs"), 0);
-        assert_eq!(insert_one(&mut store, "gen1/b.rs"), 1);
+        let store = VectorStore::new(&db_path, 4).unwrap();
+        assert_eq!(insert_one(&store, "gen1/a.rs"), 0);
+        assert_eq!(insert_one(&store, "gen1/b.rs"), 1);
 
         // Delete the top-of-range chunk (id 1) — lowers max_key to 0.
         assert_eq!(store.delete_chunks(&[1]).unwrap(), 1);
@@ -1782,8 +1817,8 @@ mod tests {
 
         // Reopen: next_id must come from the persisted high-water mark (1),
         // NOT from the lowered max_key (0). The new chunk gets id 2.
-        let mut store = VectorStore::new(&db_path, 4).unwrap();
-        assert_eq!(insert_one(&mut store, "gen2/c.rs"), 2);
+        let store = VectorStore::new(&db_path, 4).unwrap();
+        assert_eq!(insert_one(&store, "gen2/c.rs"), 2);
 
         // The deleted id stays dead: a safe miss, never unrelated content.
         let stale = store.get_chunk(1).unwrap();
@@ -1801,16 +1836,16 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("hwm-full.db");
 
-        let mut store = VectorStore::new(&db_path, 4).unwrap();
-        assert_eq!(insert_one(&mut store, "gen1/a.rs"), 0);
-        assert_eq!(insert_one(&mut store, "gen1/b.rs"), 1);
-        assert_eq!(insert_one(&mut store, "gen1/c.rs"), 2);
+        let store = VectorStore::new(&db_path, 4).unwrap();
+        assert_eq!(insert_one(&store, "gen1/a.rs"), 0);
+        assert_eq!(insert_one(&store, "gen1/b.rs"), 1);
+        assert_eq!(insert_one(&store, "gen1/c.rs"), 2);
 
         assert_eq!(store.delete_chunks(&[0, 1, 2]).unwrap(), 3);
         drop(store);
 
-        let mut store = VectorStore::new(&db_path, 4).unwrap();
-        assert_eq!(insert_one(&mut store, "gen2/d.rs"), 3);
+        let store = VectorStore::new(&db_path, 4).unwrap();
+        assert_eq!(insert_one(&store, "gen2/d.rs"), 3);
         for dead in 0..3 {
             assert!(
                 store.get_chunk(dead).unwrap().is_none(),
@@ -1826,13 +1861,13 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("hwm-clear.db");
 
-        let mut store = VectorStore::new(&db_path, 4).unwrap();
-        assert_eq!(insert_one(&mut store, "gen1/a.rs"), 0);
+        let store = VectorStore::new(&db_path, 4).unwrap();
+        assert_eq!(insert_one(&store, "gen1/a.rs"), 0);
         store.clear().unwrap();
         drop(store);
 
-        let mut store = VectorStore::new(&db_path, 4).unwrap();
-        assert_eq!(insert_one(&mut store, "gen2/b.rs"), 0);
+        let store = VectorStore::new(&db_path, 4).unwrap();
+        assert_eq!(insert_one(&store, "gen2/b.rs"), 0);
     }
 
     /// Legacy-store compat: a store whose "meta" DB carries no mark (written
@@ -1843,9 +1878,9 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("hwm-legacy.db");
 
-        let mut store = VectorStore::new(&db_path, 4).unwrap();
-        assert_eq!(insert_one(&mut store, "gen1/a.rs"), 0);
-        assert_eq!(insert_one(&mut store, "gen1/b.rs"), 1);
+        let store = VectorStore::new(&db_path, 4).unwrap();
+        assert_eq!(insert_one(&store, "gen1/a.rs"), 0);
+        assert_eq!(insert_one(&store, "gen1/b.rs"), 1);
 
         // Simulate a legacy store: strip the mark, keep the data.
         {
@@ -1860,11 +1895,11 @@ mod tests {
         }
         drop(store);
 
-        let mut store = VectorStore::new(&db_path, 4).unwrap();
+        let store = VectorStore::new(&db_path, 4).unwrap();
         // No mark, max_key = 1 → legacy derivation: next id is 2. (With the
         // top chunk deleted this WOULD reuse id 1 — that is the documented,
         // unchanged legacy risk for stores written before the mark existed.)
-        assert_eq!(insert_one(&mut store, "gen2/c.rs"), 2);
+        assert_eq!(insert_one(&store, "gen2/c.rs"), 2);
     }
 
     // === cross-generation chunk-id drift (mechanism repro → FIXED) ===
@@ -1910,7 +1945,7 @@ mod tests {
         let db_path = temp_dir.path().join("drift-low.db");
 
         {
-            let mut store = VectorStore::new(&db_path, 4).unwrap();
+            let store = VectorStore::new(&db_path, 4).unwrap();
             store
                 .insert_chunks_with_ids(vec![
                     drift_chunk("a.md", "content A0", 0),
@@ -1923,8 +1958,8 @@ mod tests {
             store.delete_chunks(&[0, 1]).unwrap();
         }
 
-        let mut store2 = VectorStore::new(&db_path, 4).unwrap();
-        assert_eq!(store2.next_id, 4, "max_key (B's id 3) keeps next_id at 4");
+        let store2 = VectorStore::new(&db_path, 4).unwrap();
+        assert_eq!(store2.next_id(), 4, "max_key (B's id 3) keeps next_id at 4");
 
         // B's ids still resolve to B after the reopen.
         let chunk = store2.get_chunk(2).unwrap().expect("id 2 must resolve");
@@ -1937,3 +1972,7 @@ mod tests {
         assert_eq!(c_ids, vec![4]);
     }
 }
+
+#[cfg(test)]
+#[path = "store_concurrency_tests.rs"]
+mod concurrency_tests;

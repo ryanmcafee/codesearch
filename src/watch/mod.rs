@@ -643,7 +643,12 @@ mod tests {
         const MAX_ATTEMPTS: u64 = 5;
         let mut output = None;
         for attempt in 0..MAX_ATTEMPTS {
-            match Command::new("git").args(args).current_dir(cwd).output() {
+            match Command::new("git")
+                .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
+                .args(args)
+                .current_dir(cwd)
+                .output()
+            {
                 Ok(o) => {
                     output = Some(o);
                     break;
@@ -823,9 +828,15 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_no_ignore_files_returns_none() {
         let dir = tempdir().unwrap();
         let root = dir.path();
+        let missing_global = root.join("no-global-codesearchignore");
+        let _env = crate::testing::EnvRestore::set(&[(
+            crate::constants::GLOBAL_CODESEARCHIGNORE_ENV,
+            missing_global.to_str().unwrap(),
+        )]);
 
         let watcher = FileWatcher::new(root.to_path_buf());
         assert!(

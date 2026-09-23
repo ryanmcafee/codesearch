@@ -98,6 +98,9 @@ pub fn get_global_cache_dir() -> PathBuf {
     cache_dir
 }
 
+/// Env var overriding the location of the global codesearchignore file.
+pub const GLOBAL_CODESEARCHIGNORE_ENV: &str = "CODESEARCH_GLOBAL_IGNORE";
+
 /// Name of the global codesearchignore file in ~/.codesearch/
 pub const GLOBAL_CODESEARCHIGNORE_FILE: &str = ".codesearchignore";
 
@@ -109,6 +112,9 @@ pub const GLOBAL_CODESEARCHIGNORE_FILE: &str = ".codesearchignore";
 ///
 /// Returns `None` only if the home directory cannot be determined.
 pub fn global_codesearchignore_path() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var(GLOBAL_CODESEARCHIGNORE_ENV) {
+        return Some(PathBuf::from(p));
+    }
     dirs::home_dir().map(|home| {
         home.join(CONFIG_DIR_NAME)
             .join(GLOBAL_CODESEARCHIGNORE_FILE)
@@ -928,7 +934,9 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn global_codesearchignore_path_returns_home_codesearch_dir() {
+        let _env = crate::testing::EnvRestore::remove(&[GLOBAL_CODESEARCHIGNORE_ENV]);
         let path = global_codesearchignore_path();
         assert!(path.is_some(), "Should return Some when home dir exists");
         let path = path.unwrap();
@@ -941,6 +949,17 @@ mod tests {
             path.file_name().unwrap(),
             GLOBAL_CODESEARCHIGNORE_FILE,
             "Filename should match GLOBAL_CODESEARCHIGNORE_FILE constant"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn global_codesearchignore_path_honours_env_override() {
+        let _env =
+            crate::testing::EnvRestore::set(&[(GLOBAL_CODESEARCHIGNORE_ENV, "/tmp/cs-ignore")]);
+        assert_eq!(
+            global_codesearchignore_path(),
+            Some(PathBuf::from("/tmp/cs-ignore"))
         );
     }
 }

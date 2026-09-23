@@ -1060,16 +1060,11 @@ impl VectorStore {
     /// either the old chunks or the new ones, never a gap.
     ///
     /// Returns the ids assigned to `chunks`.
-    pub fn replace_chunks(
-        &self,
-        stale_ids: &[u32],
-        chunks: Vec<EmbeddedChunk>,
-    ) -> Result<Vec<u32>> {
+    pub fn replace_chunks(&self, stale_ids: &[u32], chunks: &[EmbeddedChunk]) -> Result<Vec<u32>> {
         if stale_ids.is_empty() && chunks.is_empty() {
             return Ok(vec![]);
         }
-        self.apply_with_retry(stale_ids, &chunks)
-            .map(|(_, ids)| ids)
+        self.apply_with_retry(stale_ids, chunks).map(|(_, ids)| ids)
     }
 
     /// Run [`Self::apply_impl`] under the writer lock with MDB_MAP_FULL auto-resize.

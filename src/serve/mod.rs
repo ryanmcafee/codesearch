@@ -2434,11 +2434,8 @@ impl ServeState {
                 alias, total_chunks
             );
             let vector_store = Arc::clone(&stores.vector_store);
-            match tokio::task::spawn_blocking(move || {
-                let vstore = &vector_store;
-                vstore.build_index()
-            })
-            .await
+            match crate::index::executor::spawn_index_blocking(move || vector_store.build_index())
+                .await
             {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
@@ -2595,7 +2592,7 @@ impl ServeState {
         {
             let vector_store = Arc::clone(&stores.vector_store);
             let alias_owned = alias.to_string();
-            match tokio::task::spawn_blocking(move || {
+            match crate::index::executor::spawn_index_blocking(move || {
                 let vstore = &vector_store;
                 // `index_health()`, not `stats()` — the predicate needs exactly
                 // `(total_chunks, indexed)`, while `stats()` deserializes every
@@ -3728,7 +3725,18 @@ async fn status_handler(
         "csharp_helper": csharp_helper,
         "ts_helper": ts_helper,
         "uptime_secs": uptime_secs,
+        "qos": qos_status_json(),
     }))
+}
+
+/// Scheduling classes in effect: `read` is the calling (tool-serving) thread.
+fn qos_status_json() -> serde_json::Value {
+    let pool = crate::index::executor::global();
+    json!({
+        "read": crate::qos::current_thread().map(crate::qos::ThreadQos::as_str),
+        "index": pool.qos().as_str(),
+        "index_threads": pool.threads(),
+    })
 }
 
 /// Projection of a federation peer that is safe to expose over `GET /remotes`.
@@ -4751,11 +4759,8 @@ async fn add_repo_handler(
         {
             let vector_store = Arc::clone(&stores.vector_store);
             let alias_bi = alias_bg.clone();
-            match tokio::task::spawn_blocking(move || {
-                let vstore = &vector_store;
-                vstore.build_index()
-            })
-            .await
+            match crate::index::executor::spawn_index_blocking(move || vector_store.build_index())
+                .await
             {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {

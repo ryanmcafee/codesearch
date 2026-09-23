@@ -20,8 +20,9 @@ use crate::constants::{
     DB_DIR_NAME, DEFAULT_FSW_DEBOUNCE_MS, FILE_META_DB_NAME, LANG_CSHARP, LANG_TYPESCRIPT,
     SCIP_CSHARP_DEBOUNCE_MS, SCIP_TYPESCRIPT_DEBOUNCE_MS, WRITER_LOCK_FILE,
 };
-use crate::embed::ModelType;
+use crate::embed::{EmbeddedChunk, ModelType};
 use crate::fts::FtsStore;
+use crate::index::executor::spawn_index_blocking;
 use crate::symbols::{RebuildScope, SymbolIndexer, SymbolIndexerRegistry};
 use crate::vectordb::VectorStore;
 use crate::watch::{FileEvent, FileWatcher, GitHeadWatcher};
@@ -195,6 +196,48 @@ pub struct SharedStores {
     /// Counter for number of file changes processed (indexed + removed) since serve start.
     /// Incremented by FSW batches and incremental refreshes. Read by TUI/dashboard.
     pub changes_count: std::sync::atomic::AtomicU64,
+}
+
+/// Swap `stale_ids` for `embedded` in both stores on the indexing pool.
+///
+/// Returns the new chunk ids and hands `embedded` back for metadata bookkeeping.
+async fn apply_to_stores(
+    stores: &SharedStores,
+    stale_ids: Vec<u32>,
+    embedded: Vec<EmbeddedChunk>,
+) -> Result<(Vec<u32>, Vec<EmbeddedChunk>)> {
+    if stale_ids.is_empty() && embedded.is_empty() {
+        return Ok((Vec::new(), embedded));
+    }
+    let vector_store = Arc::clone(&stores.vector_store);
+    let fts_store = Arc::clone(&stores.fts_store);
+    spawn_index_blocking(move || -> Result<(Vec<u32>, Vec<EmbeddedChunk>)> {
+        let ids = vector_store.replace_chunks(&stale_ids, &embedded)?;
+        for id in &stale_ids {
+            fts_store.delete_chunk(*id)?;
+        }
+        for (chunk, id) in embedded.iter().zip(&ids) {
+            fts_store.add_chunk(
+                *id,
+                &chunk.chunk.content,
+                &chunk.chunk.path.to_string(),
+                chunk.chunk.signature.as_deref(),
+                &format!("{:?}", chunk.chunk.kind),
+            )?;
+        }
+        fts_store.commit()?;
+        Ok((ids, embedded))
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("store update task failed: {e}"))?
+}
+
+/// Build (or no-op publish) the HNSW graph on the indexing pool.
+async fn build_index_on_pool(stores: &SharedStores) -> Result<()> {
+    let vector_store = Arc::clone(&stores.vector_store);
+    spawn_index_blocking(move || vector_store.build_index())
+        .await
+        .map_err(|e| anyhow::anyhow!("build_index task failed: {e}"))?
 }
 
 impl SharedStores {
@@ -558,7 +601,6 @@ impl IndexManager {
     ) -> Result<()> {
         use crate::cache::FileMetaStore;
         use crate::chunker::SemanticChunker;
-        use crate::embed::EmbeddingService;
         use crate::file::FileWalker;
 
         info!("🔄 Performing incremental refresh with shared stores...");
@@ -624,7 +666,7 @@ impl IndexManager {
         // traversal). Offload it to `spawn_blocking` so it does not block tokio
         // worker threads during warmup.
         let codebase = codebase_path.to_path_buf();
-        let (files, _stats) = tokio::task::spawn_blocking(move || FileWalker::new(codebase).walk())
+        let (files, _stats) = spawn_index_blocking(move || FileWalker::new(codebase).walk())
             .await
             .map_err(|e| anyhow::anyhow!("file walk task panicked: {}", e))??;
 
@@ -679,13 +721,7 @@ impl IndexManager {
             deleted_ids.extend(chunk_ids);
             file_meta_store.remove_file(Path::new(file_path));
         }
-        if !deleted_ids.is_empty() {
-            stores.vector_store.delete_chunks(&deleted_ids)?;
-            for chunk_id in &deleted_ids {
-                stores.fts_store.delete_chunk(*chunk_id)?;
-            }
-            stores.fts_store.commit()?;
-        }
+        apply_to_stores(stores, deleted_ids, Vec::new()).await?;
 
         // Changed files keep their old chunks until their batch below replaces
         // them atomically, so they stay searchable while the refresh runs.
@@ -734,8 +770,8 @@ impl IndexManager {
                 // DURING the (long, core-saturating) embed pass is observed
                 // per-file, not only once the whole batch returns.
                 let batch_cancel = cancel_token.clone();
-                let embedded_chunks = tokio::task::spawn_blocking(
-                    move || -> Result<Vec<crate::embed::EmbeddedChunk>> {
+                let embedded_chunks =
+                    spawn_index_blocking(move || -> Result<Vec<crate::embed::EmbeddedChunk>> {
                         let mut chunker = SemanticChunker::new(100, 2000, 10);
                         let mut all_chunks = Vec::new();
 
@@ -759,28 +795,23 @@ impl IndexManager {
                             return Ok(Vec::new());
                         }
 
-                        let mut embedding_service = EmbeddingService::with_cache_dir(
+                        // Fans out across the indexing pool; each pool thread
+                        // keeps one single-threaded ONNX session per model.
+                        crate::index::executor::global().embed_chunks(
                             embed_model,
-                            Some(cache_dir_for_batch.as_path()),
-                        )?;
-                        // NOTE: embed_chunks runs a single ONNX inference over
-                        // the whole batch atomically, so it is not interruptible
-                        // mid-call. Worst-case cancel latency is bounded to one
-                        // batch's embed (INCREMENTAL_REFRESH_BATCH_SIZE=200
-                        // files); the per-file check above bounds the read/chunk
-                        // phase that precedes it.
-                        embedding_service.embed_chunks(all_chunks)
-                    },
-                )
-                .await
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "chunk+embed task panicked (batch {}/{}): {}",
-                        batch_idx + 1,
-                        total_batches,
-                        e
-                    )
-                })??;
+                            &cache_dir_for_batch,
+                            all_chunks,
+                        )
+                    })
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "chunk+embed task panicked (batch {}/{}): {}",
+                            batch_idx + 1,
+                            total_batches,
+                            e
+                        )
+                    })??;
 
                 // A cancel arriving after embed completed but before we commit
                 // the batch to the stores must skip the insert + the final
@@ -801,34 +832,11 @@ impl IndexManager {
                         embed_model.short_name()
                     );
 
-                    // Swap this batch's old chunks for the new ones in one
-                    // write txn. A store that is already serving reads
-                    // publishes an incremental HNSW build in the same txn; a
-                    // fresh store defers the build to the end of the refresh.
-                    let chunk_ids = stores
-                        .vector_store
-                        .replace_chunks(&stale_ids, embedded_chunks.clone())?;
-
-                    // Replace in FTS (one commit per batch)
-                    {
-                        let fts_store = &stores.fts_store;
-                        for chunk_id in &stale_ids {
-                            fts_store.delete_chunk(*chunk_id)?;
-                        }
-                        for (chunk, chunk_id) in embedded_chunks.iter().zip(chunk_ids.iter()) {
-                            let path_str = chunk.chunk.path.to_string();
-                            let signature = chunk.chunk.signature.as_deref();
-                            let kind = format!("{:?}", chunk.chunk.kind);
-                            fts_store.add_chunk(
-                                *chunk_id,
-                                &chunk.chunk.content,
-                                &path_str,
-                                signature,
-                                &kind,
-                            )?;
-                        }
-                        fts_store.commit()?;
-                    }
+                    // Swap this batch's old chunks for the new ones in one write
+                    // txn per store; a serving store publishes its incremental
+                    // HNSW build in the same txn.
+                    let (chunk_ids, embedded_chunks) =
+                        apply_to_stores(stores, stale_ids, embedded_chunks).await?;
 
                     // Update file metadata for this batch's files.
                     // Group chunks by file path (normalize for consistent lookup)
@@ -858,13 +866,7 @@ impl IndexManager {
                     // ALL files in this batch produced 0 chunks — drop their
                     // old chunks and still track them so they are not flagged
                     // as unindexed on every subsequent run.
-                    if !stale_ids.is_empty() {
-                        stores.vector_store.delete_chunks(&stale_ids)?;
-                        for chunk_id in &stale_ids {
-                            stores.fts_store.delete_chunk(*chunk_id)?;
-                        }
-                        stores.fts_store.commit()?;
-                    }
+                    apply_to_stores(stores, stale_ids, Vec::new()).await?;
                     for file in file_batch {
                         file_meta_store.update_file(&file.path, vec![])?;
                     }
@@ -875,13 +877,7 @@ impl IndexManager {
             if total_indexed > 0 {
                 // Don't rebuild the graph for a repo that was removed mid-index.
                 Self::ensure_indexing_active(cancel_token)?;
-                let vector_store = Arc::clone(&stores.vector_store);
-                tokio::task::spawn_blocking(move || {
-                    let store = &vector_store;
-                    store.build_index()
-                })
-                .await
-                .map_err(|e| anyhow::anyhow!("build_index task panicked: {}", e))??;
+                build_index_on_pool(stores).await?;
             }
 
             info!(
@@ -1918,12 +1914,9 @@ impl IndexManager {
             }
         }
 
-        // Rebuild vector index after removals so deleted chunks are excluded from search results.
-        // index_single_file_with_stores already calls build_index() per file, but when a batch
-        // contains ONLY removals (no additions), the index would never be rebuilt without this.
+        // Builds a first graph if removals left an unbuilt store; otherwise a no-op.
         if !files_to_remove.is_empty() {
-            let store = &stores.vector_store;
-            store.build_index()?;
+            build_index_on_pool(stores).await?;
         }
 
         // Then, index modified/new files
@@ -2000,7 +1993,7 @@ impl IndexManager {
             // `walk()` is synchronous + I/O-heavy — offload off the async executor.
             let codebase = codebase_path.to_path_buf();
             let (files, stats) =
-                tokio::task::spawn_blocking(move || FileWalker::new(codebase).walk())
+                spawn_index_blocking(move || FileWalker::new(codebase).walk())
                     .await
                     .map_err(|e| anyhow::anyhow!("file walk task panicked: {}", e))??;
             info!(
@@ -2029,10 +2022,11 @@ impl IndexManager {
             let mut files_to_reindex: Vec<PathBuf> = Vec::new();
             let mut chunks_to_delete: Vec<u32> = Vec::new();
 
+            // Changed files keep their chunks until index_single_file swaps them.
             for file_info in &files {
-                let (needs_reindex, old_chunk_ids) = file_meta_store.check_file(&file_info.path)?;
+                let (needs_reindex, _old_chunk_ids) =
+                    file_meta_store.check_file(&file_info.path)?;
                 if needs_reindex {
-                    chunks_to_delete.extend(old_chunk_ids);
                     files_to_reindex.push(file_info.path.clone());
                 }
             }
@@ -2052,25 +2046,13 @@ impl IndexManager {
                 chunks_to_delete.len()
             );
 
-            // Phase 3: Collect ALL chunk IDs to delete (changed + deleted files)
+            // Phase 3: Collect chunk IDs of deleted files
             for (_file_path, chunk_ids) in &deleted_files {
                 chunks_to_delete.extend(chunk_ids);
             }
 
             // Batch-delete all stale chunks from both stores
-            if !chunks_to_delete.is_empty() {
-                {
-                    let vstore = &stores.vector_store;
-                    vstore.delete_chunks(&chunks_to_delete)?;
-                }
-                {
-                    let fstore = &stores.fts_store;
-                    for &chunk_id in &chunks_to_delete {
-                        fstore.delete_chunk(chunk_id)?;
-                    }
-                    fstore.commit()?;
-                }
-            }
+            apply_to_stores(stores, chunks_to_delete, Vec::new()).await?;
 
             // Remove deleted files from FileMetaStore
             let mut deleted_count = deleted_files.len();
@@ -2082,24 +2064,16 @@ impl IndexManager {
             // index_single_file loads its own fresh copy per file)
             file_meta_store.save(db_path)?;
 
-            // Rebuild vector index after FileMetaStore-based deletions.
-            // `build_index()` is CPU-heavy — run it on `spawn_blocking`.
-            {
-                let vector_store = Arc::clone(&stores.vector_store);
-                tokio::task::spawn_blocking(move || {
-                    let vstore = &vector_store;
-                    vstore.build_index()
-                })
-                .await
-                .map_err(|e| anyhow::anyhow!("build_index task panicked: {}", e))??;
-            }
+            build_index_on_pool(stores).await?;
 
             // Phase 3.5: VectorStore-direct orphan cleanup
             // FileMetaStore may not track all ghost chunks (from pre-fix indexing runs).
             // Directly scan the VectorStore for chunks referencing files not on disk.
             {
-                let vstore = &stores.vector_store;
-                let vs_file_chunks = vstore.get_chunks_by_file()?;
+                let vector_store = Arc::clone(&stores.vector_store);
+                let vs_file_chunks = spawn_index_blocking(move || vector_store.get_chunks_by_file())
+                    .await
+                    .map_err(|e| anyhow::anyhow!("orphan scan task failed: {e}"))??;
 
                 let mut orphan_chunk_ids: Vec<u32> = Vec::new();
                 let mut orphan_file_count = 0usize;
@@ -2118,35 +2092,13 @@ impl IndexManager {
                         orphan_file_count
                     );
 
-                    // Delete orphan chunks from VectorStore, then rebuild the
-                    // HNSW index off the async executor (CPU-heavy).
-                    {
-                        let vstore = &stores.vector_store;
-                        vstore.delete_chunks(&orphan_chunk_ids)?;
-                    }
-                    {
-                        let vector_store = Arc::clone(&stores.vector_store);
-                        tokio::task::spawn_blocking(move || {
-                            let vstore = &vector_store;
-                            vstore.build_index()
-                        })
-                        .await
-                        .map_err(|e| anyhow::anyhow!("build_index task panicked: {}", e))??;
-                    }
-
-                    // Delete orphan chunks from FtsStore
-                    {
-                        let fstore = &stores.fts_store;
-                        for &cid in &orphan_chunk_ids {
-                            let _ = fstore.delete_chunk(cid);
-                        }
-                        fstore.commit()?;
-                    }
+                    let orphan_count = orphan_chunk_ids.len();
+                    apply_to_stores(stores, orphan_chunk_ids, Vec::new()).await?;
+                    build_index_on_pool(stores).await?;
 
                     info!(
                         "✅ Cleaned {} orphan chunks from {} ghost files in VectorStore",
-                        orphan_chunk_ids.len(),
-                        orphan_file_count
+                        orphan_count, orphan_file_count
                     );
 
                     deleted_count += orphan_file_count;
@@ -2256,12 +2208,27 @@ impl IndexManager {
         file_path: &Path,
         stores: &SharedStores,
     ) -> Result<()> {
+        let db_path = codebase_path.join(DB_DIR_NAME);
+        let file = file_path.to_path_buf();
+        let vector_store = Arc::clone(&stores.vector_store);
+        let fts_store = Arc::clone(&stores.fts_store);
+        spawn_index_blocking(move || {
+            Self::index_single_file_blocking(&db_path, &file, &vector_store, &fts_store)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("indexing {} failed: {e}", file_path.display()))?
+    }
+
+    /// Chunk, embed and swap one file's chunks; runs on the indexing pool.
+    fn index_single_file_blocking(
+        db_path: &Path,
+        file_path: &Path,
+        vector_store: &VectorStore,
+        fts_store: &FtsStore,
+    ) -> Result<()> {
         use crate::cache::FileMetaStore;
         use crate::chunker::{Chunker, SemanticChunker};
-        use crate::embed::EmbeddingService;
         use crate::file::Language;
-
-        let db_path = codebase_path.join(DB_DIR_NAME);
 
         // Check if file exists and is indexable
         if !file_path.exists() {
@@ -2303,19 +2270,18 @@ impl IndexManager {
         // The live watcher path must re-embed changed files with the SAME model
         // the index was created with — using the hardcoded default here would
         // write 384d vectors into a non-384d index and corrupt it.
-        let (embed_model, dimensions) = Self::resolve_embed_model(&db_path)?;
+        let (embed_model, dimensions) = Self::resolve_embed_model(db_path)?;
         let model_name = embed_model.short_name();
 
         // Generate embeddings
         let cache_dir = crate::constants::get_global_models_cache_dir()?;
-        let mut embedding_service =
-            EmbeddingService::with_cache_dir(embed_model, Some(cache_dir.as_path()))?;
-        let embedded_chunks = embedding_service.embed_chunks(chunks)?;
+        let embedded_chunks =
+            crate::index::executor::global().embed_chunks(embed_model, &cache_dir, chunks)?;
 
         // Swap the file's previous chunks for the new ones in one write txn so
         // readers never see the file missing or duplicated. `remove_file`
         // hands back the previous chunk ids (if any).
-        let mut file_meta_store = FileMetaStore::load_or_create(&db_path, model_name, dimensions)?;
+        let mut file_meta_store = FileMetaStore::load_or_create(db_path, model_name, dimensions)?;
         let old_ids = file_meta_store
             .remove_file(file_path)
             .map(|meta| meta.chunk_ids)
@@ -2327,15 +2293,12 @@ impl IndexManager {
                 file_path.display()
             );
         }
-        let chunk_ids = stores
-            .vector_store
-            .replace_chunks(&old_ids, embedded_chunks.clone())?;
+        let chunk_ids = vector_store.replace_chunks(&old_ids, &embedded_chunks)?;
         // No-op when the store already serves reads (the replace published the
         // graph); builds a first graph for a store that has none yet.
-        stores.vector_store.build_index()?;
+        vector_store.build_index()?;
 
         {
-            let fts_store = &stores.fts_store;
             for id in &old_ids {
                 fts_store.delete_chunk(*id)?;
             }
@@ -2355,7 +2318,7 @@ impl IndexManager {
         }
 
         file_meta_store.update_file(file_path, chunk_ids)?;
-        file_meta_store.save(&db_path)?;
+        file_meta_store.save(db_path)?;
 
         info!(
             "✅ Indexed {} ({} chunks)",
@@ -2414,25 +2377,13 @@ impl IndexManager {
             file_path.display()
         );
 
-        stores.vector_store.delete_chunks(&chunk_ids)?;
-
-        // Delete from FTS with write lock
-        {
-            let fts_store = &stores.fts_store;
-            for chunk_id in &chunk_ids {
-                fts_store.delete_chunk(*chunk_id)?;
-            }
-            fts_store.commit()?;
-        }
+        let removed = chunk_ids.len();
+        apply_to_stores(stores, chunk_ids, Vec::new()).await?;
 
         // Save file metadata (remove_file was already called above)
         file_meta_store.save(db_path)?;
 
-        info!(
-            "✅ Removed {} chunks for {}",
-            chunk_ids.len(),
-            file_path.display()
-        );
+        info!("✅ Removed {} chunks for {}", removed, file_path.display());
 
         Ok(())
     }

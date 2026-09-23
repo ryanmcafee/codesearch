@@ -147,7 +147,7 @@ fn replace_chunks_swaps_a_files_chunks_in_one_snapshot() {
     let new = store
         .replace_chunks(
             &old,
-            vec![chunk("lib.rs", "fn new_version() {}", [0.0, 1.0, 0.0, 0.0])],
+            &[chunk("lib.rs", "fn new_version() {}", [0.0, 1.0, 0.0, 0.0])],
         )
         .unwrap();
 

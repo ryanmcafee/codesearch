@@ -5,7 +5,7 @@ mod embedder;
 pub use batch::{BatchEmbedder, EmbeddedChunk};
 pub use cache::{
     CacheStats, CachedBatchEmbedder, PersistentCacheStats, PersistentEmbeddingCache, QueryCache,
-    QueryCacheStats,
+    QueryCacheStats, SharedPersistentCache,
 };
 pub use embedder::{FastEmbedder, ModelType};
 
@@ -19,7 +19,7 @@ pub struct EmbeddingService {
     cached_embedder: CachedBatchEmbedder,
     model_type: ModelType,
     query_cache: QueryCache,
-    persistent_cache: Option<PersistentEmbeddingCache>,
+    persistent_cache: Option<SharedPersistentCache>,
 }
 
 impl EmbeddingService {
@@ -38,7 +38,25 @@ impl EmbeddingService {
         model_type: ModelType,
         cache_dir: Option<&std::path::Path>,
     ) -> Result<Self> {
-        let embedder = FastEmbedder::with_cache_dir(model_type, cache_dir)?;
+        Self::build(
+            FastEmbedder::with_cache_dir(model_type, cache_dir)?,
+            model_type,
+        )
+    }
+
+    /// Embedding service for indexing threads: single-threaded ONNX so the
+    /// work runs at the calling thread's (background) QoS.
+    pub fn for_indexing(
+        model_type: ModelType,
+        cache_dir: Option<&std::path::Path>,
+    ) -> Result<Self> {
+        Self::build(
+            FastEmbedder::with_threads(model_type, cache_dir, Some(1))?,
+            model_type,
+        )
+    }
+
+    fn build(embedder: FastEmbedder, model_type: ModelType) -> Result<Self> {
         let arc_embedder = Arc::new(Mutex::new(embedder));
         let batch_embedder = BatchEmbedder::new(arc_embedder);
 
@@ -57,7 +75,7 @@ impl EmbeddingService {
         // Initialize persistent embedding cache (disk-backed, survives restarts)
         // This is critical for fast branch switches: embeddings for previously-seen
         // content are looked up by content hash instead of recomputed via ONNX.
-        let persistent_cache = match PersistentEmbeddingCache::open(model_type.short_name()) {
+        let persistent_cache = match PersistentEmbeddingCache::shared(model_type.short_name()) {
             Ok(cache) => {
                 tracing::debug!("📦 Persistent embedding cache opened");
                 Some(cache)
@@ -92,17 +110,17 @@ impl EmbeddingService {
             return Ok(Vec::new());
         }
 
-        let persistent_cache = self.persistent_cache.as_ref();
-        if persistent_cache.is_none() {
+        let Some(shared_cache) = self.persistent_cache.clone() else {
             // No persistent cache — use in-memory only path
             return self.cached_embedder.embed_chunks(chunks);
-        }
-        let cache = persistent_cache.unwrap();
+        };
+        let lock_cache = || shared_cache.lock().unwrap_or_else(|e| e.into_inner());
 
         // Phase 1: Check persistent cache for each chunk by content hash
         let mut results: Vec<(usize, EmbeddedChunk)> = Vec::with_capacity(chunks.len());
         let mut misses: Vec<(usize, crate::chunker::Chunk)> = Vec::new();
 
+        let cache = lock_cache();
         for (i, chunk) in chunks.iter().enumerate() {
             match cache.get(&chunk.hash) {
                 Ok(Some(embedding)) => {
@@ -114,6 +132,7 @@ impl EmbeddingService {
             }
         }
 
+        drop(cache);
         let cache_hits = results.len();
         let cache_misses = misses.len();
 
@@ -124,6 +143,7 @@ impl EmbeddingService {
             let embedded = self.cached_embedder.embed_chunks(miss_chunks)?;
 
             // Phase 3: Store newly computed embeddings in persistent cache
+            let cache = lock_cache();
             let entries: Vec<(&str, &[f32])> = embedded
                 .iter()
                 .map(|ec| (ec.chunk.hash.as_str(), ec.embedding.as_slice()))
@@ -262,8 +282,8 @@ impl EmbeddingService {
     #[allow(dead_code)]
     pub fn with_persistent_cache(&mut self) -> Result<()> {
         if self.persistent_cache.is_none() {
-            let cache = PersistentEmbeddingCache::open(self.model_short_name())?;
-            self.persistent_cache = Some(cache);
+            self.persistent_cache =
+                Some(PersistentEmbeddingCache::shared(self.model_short_name())?);
         }
         Ok(())
     }
@@ -271,25 +291,17 @@ impl EmbeddingService {
     #[allow(dead_code)]
     /// Get persistent cache statistics
     pub fn persistent_cache_stats(&self) -> Option<PersistentCacheStats> {
-        self.persistent_cache.as_ref().and_then(|c| c.stats().ok())
+        self.persistent_cache
+            .as_ref()
+            .and_then(|c| c.lock().unwrap_or_else(|e| e.into_inner()).stats().ok())
     }
     #[allow(dead_code)]
     /// Clear the persistent cache
     pub fn clear_persistent_cache(&mut self) -> Result<()> {
-        if let Some(cache) = &mut self.persistent_cache {
-            cache.clear()?;
+        if let Some(cache) = &self.persistent_cache {
+            cache.lock().unwrap_or_else(|e| e.into_inner()).clear()?;
         }
         Ok(())
-    }
-    #[allow(dead_code)]
-    /// Get reference to persistent cache (if initialized)
-    pub fn persistent_cache(&self) -> Option<&PersistentEmbeddingCache> {
-        self.persistent_cache.as_ref()
-    }
-    #[allow(dead_code)]
-    /// Get mutable reference to persistent cache (if initialized)
-    pub fn persistent_cache_mut(&mut self) -> Option<&mut PersistentEmbeddingCache> {
-        self.persistent_cache.as_mut()
     }
 }
 

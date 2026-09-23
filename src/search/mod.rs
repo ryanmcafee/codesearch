@@ -1149,7 +1149,7 @@ fn sync_database(db_path: &Path, model_type: ModelType) -> Result<()> {
 
         // Embed, then swap old chunks for new in one write txn
         let embedded_chunks = embedding_service.embed_chunks(chunks)?;
-        let chunk_ids = store.replace_chunks(&old_chunk_ids, embedded_chunks)?;
+        let chunk_ids = store.replace_chunks(&old_chunk_ids, &embedded_chunks)?;
         file_meta.update_file(&file.path, chunk_ids)?;
     }
 

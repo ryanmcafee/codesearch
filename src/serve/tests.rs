@@ -3089,3 +3089,14 @@ async fn self_clean_keeps_the_db_dir_of_a_still_registered_repo() {
         "an unregistered alias's orphaned DB dir must still be cleaned up"
     );
 }
+
+#[tokio::test]
+async fn status_reports_the_indexing_pool_qos() {
+    let qos = qos_status_json();
+    assert!(
+        ["background", "utility", "user-initiated"].contains(&qos["index"].as_str().unwrap()),
+        "{qos}"
+    );
+    assert!(qos["index_threads"].as_u64().unwrap() >= 1, "{qos}");
+    assert!(qos.get("read").is_some(), "{qos}");
+}

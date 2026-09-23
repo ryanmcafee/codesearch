@@ -13,6 +13,7 @@ mod lmdb_registry;
 mod logger;
 mod mcp;
 mod output;
+mod qos;
 mod rerank;
 mod search;
 mod serve;
@@ -28,8 +29,18 @@ use tokio_util::sync::CancellationToken;
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // Tool calls run on these threads; indexing runs on its own background-QoS pool.
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .on_thread_start(|| {
+            let _ = qos::set_current_thread(qos::ThreadQos::UserInitiated);
+        })
+        .build()?
+        .block_on(run())
+}
+
+async fn run() -> Result<()> {
     // Parse CLI to get loglevel (need this before tracing init)
     let args: Vec<String> = std::env::args().collect();
     let is_quiet = args.iter().any(|a| a == "-q" || a == "--quiet");

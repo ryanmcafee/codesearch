@@ -278,7 +278,9 @@ impl FtsStore {
             // With NoMergePolicy, all segment management is explicit: we accumulate
             // segments during indexing and they're consolidated at commit points.
             // This trades slightly more segments for 100% reliability.
-            match index.writer(50_000_000) {
+            // One indexing thread: tantivy's workers cannot be demoted to
+            // background QoS, so keep their CPU share small.
+            match index.writer_with_num_threads(1, 50_000_000) {
                 Ok(writer) => {
                     writer.set_merge_policy(Box::new(NoMergePolicy));
                     return Ok(writer);

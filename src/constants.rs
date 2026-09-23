@@ -98,6 +98,12 @@ pub fn get_global_cache_dir() -> PathBuf {
     cache_dir
 }
 
+/// Env var sizing the low-priority indexing thread pool (default: cores / 4, 1..=4).
+pub const INDEX_THREADS_ENV: &str = "CODESEARCH_INDEX_THREADS";
+
+/// Env var choosing the indexing pool's QoS: `background` (default) or `utility`.
+pub const INDEX_QOS_ENV: &str = "CODESEARCH_INDEX_QOS";
+
 /// Env var overriding the location of the global codesearchignore file.
 pub const GLOBAL_CODESEARCHIGNORE_ENV: &str = "CODESEARCH_GLOBAL_IGNORE";
 

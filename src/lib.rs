@@ -14,6 +14,7 @@ pub mod lmdb_registry;
 pub mod logger;
 pub mod mcp;
 pub mod output;
+pub mod qos;
 pub mod rerank;
 pub mod search;
 pub mod serve;

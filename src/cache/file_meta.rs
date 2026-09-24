@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -123,6 +123,11 @@ pub fn normalize_user_path(path: &Path) -> PathBuf {
 pub fn safe_canonicalize(path: &Path) -> std::io::Result<PathBuf> {
     let translated = translate_msys_path(path);
     translated.canonicalize().map(strip_unc_prefix)
+}
+
+/// Normalized keys of the files a walk produced, for [`FileMetaStore::find_stale_files`].
+pub fn walked_paths<'a>(paths: impl IntoIterator<Item = &'a Path>) -> HashSet<String> {
+    paths.into_iter().map(normalize_path).collect()
 }
 
 /// Normalize a file path for consistent HashMap lookups.
@@ -438,6 +443,16 @@ impl FileMetaStore {
         self.files
             .iter()
             .filter(|(path, _)| !Path::new(path).exists())
+            .map(|(path, meta)| (path.clone(), meta.chunk_ids.clone()))
+            .collect()
+    }
+
+    /// Tracked files that are gone from disk or no longer produced by the walk
+    /// (now ignored or not indexable), with their chunk ids.
+    pub fn find_stale_files(&self, walked: &HashSet<String>) -> Vec<(String, Vec<u32>)> {
+        self.files
+            .iter()
+            .filter(|(path, _)| !walked.contains(*path) || !Path::new(path).exists())
             .map(|(path, meta)| (path.clone(), meta.chunk_ids.clone()))
             .collect()
     }

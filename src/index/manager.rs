@@ -706,7 +706,9 @@ impl IndexManager {
         }
 
         // Find deleted files
-        let deleted_files = file_meta_store.find_deleted_files();
+        let deleted_files = file_meta_store.find_stale_files(&crate::cache::walked_paths(
+            files.iter().map(|f| f.path.as_path()),
+        ));
 
         info!(
             "   Unchanged: {}, Changed: {}, Deleted: {}",
@@ -2092,7 +2094,9 @@ impl IndexManager {
             }
 
             // Find files that were deleted (tracked in metadata but not on disk)
-            let deleted_files = file_meta_store.find_deleted_files();
+            let deleted_files = file_meta_store.find_stale_files(&crate::cache::walked_paths(
+            files.iter().map(|f| f.path.as_path()),
+        ));
 
             if files_to_reindex.is_empty() && deleted_files.is_empty() {
                 info!("✅ Branch refresh: index is up to date, no changes needed");

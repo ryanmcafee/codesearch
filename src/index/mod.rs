@@ -724,7 +724,9 @@ async fn index_with_options(
         }
 
         // Find deleted files (in metadata but not on disk)
-        let deleted_files = file_meta_store.find_deleted_files();
+        let deleted_files = file_meta_store.find_stale_files(&crate::cache::walked_paths(
+            files.iter().map(|f| f.path.as_path()),
+        ));
 
         for (file_path, _chunk_ids) in &deleted_files {
             debug!("🗑️  File deleted from disk: {}", file_path);

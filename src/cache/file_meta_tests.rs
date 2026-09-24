@@ -519,3 +519,31 @@ fn test_path_matches_filter_matches_exact_directory_name() {
     let filter = normalize_filter_path("src");
     assert!(path_matches_filter("/repo/src/main.rs", &filter, &root));
 }
+
+#[test]
+fn find_stale_files_reports_deleted_and_no_longer_walked_files() {
+    let tmp = tempdir().unwrap();
+    let kept = tmp.path().join("kept.rs");
+    let ignored = tmp.path().join("now_ignored.rs");
+    let deleted = tmp.path().join("deleted.rs");
+    for f in [&kept, &ignored, &deleted] {
+        std::fs::write(f, "fn x() {}\n").unwrap();
+    }
+    let mut store = FileMetaStore::new("minilm-l6-q".to_string(), 384);
+    store.update_file(&kept, vec![1]).unwrap();
+    store.update_file(&ignored, vec![2, 3]).unwrap();
+    store.update_file(&deleted, vec![4]).unwrap();
+    std::fs::remove_file(&deleted).unwrap();
+
+    let walked: HashSet<String> = [normalize_path(&kept)].into_iter().collect();
+    let mut stale = store.find_stale_files(&walked);
+    stale.sort();
+
+    assert_eq!(
+        stale,
+        vec![
+            (normalize_path(&deleted), vec![4]),
+            (normalize_path(&ignored), vec![2, 3]),
+        ]
+    );
+}

@@ -1,8 +1,9 @@
 use anyhow::{anyhow, Result};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
+use ignore::Match;
 use notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{new_debouncer, DebounceEventResult, Debouncer, RecommendedCache};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::{channel, Receiver};
@@ -69,19 +70,105 @@ pub struct FileWatcher {
     root: PathBuf,
     debouncer: Option<Debouncer<RecommendedWatcher, RecommendedCache>>,
     receiver: Option<Receiver<DebounceEventResult>>,
-    /// Compiled .gitignore matcher for the repo root (None if no .gitignore found).
-    gitignore: Option<Gitignore>,
+    /// `root` resolved through symlinks (macOS FSEvents reports `/private/var/...`
+    /// for a root registered as `/var/...`); `None` when identical to `root`.
+    canonical_root: Option<PathBuf>,
+    /// Root-level rules: global codesearchignore, `.git/info/exclude`, root
+    /// `.gitignore` and `.codesearchignore` (None if none exist).
+    gitignore: std::sync::RwLock<Option<Gitignore>>,
+    /// Per-directory ignore files below the root, loaded on first use.
+    nested: std::sync::Mutex<HashMap<PathBuf, Option<Gitignore>>>,
+    /// `core.excludesFile`, honoured by the walker via `git_global`.
+    git_global: Option<Gitignore>,
+}
+
+/// Ignore files the walker honours in every directory (later entries win).
+const DIR_IGNORE_FILES: [&str; 3] = [".gitignore", ".codesearchignore", ".osgrepignore"];
+
+fn decision(m: Match<&ignore::gitignore::Glob>) -> Option<bool> {
+    match m {
+        Match::Ignore(_) => Some(true),
+        Match::Whitelist(_) => Some(false),
+        Match::None => None,
+    }
 }
 
 impl FileWatcher {
     /// Create a new file watcher for the given root directory
     pub fn new(root: PathBuf) -> Self {
         let gitignore = Self::build_gitignore(&root);
+        let canonical_root = crate::cache::safe_canonicalize(&root)
+            .ok()
+            .filter(|c| c != &root);
+        let (global, _) = Gitignore::global();
+        let git_global = (global.num_ignores() + global.num_whitelists() > 0).then_some(global);
         Self {
             root,
             debouncer: None,
             receiver: None,
-            gitignore,
+            canonical_root,
+            gitignore: std::sync::RwLock::new(gitignore),
+            nested: std::sync::Mutex::new(HashMap::new()),
+            git_global,
+        }
+    }
+
+    /// Matcher for the ignore files directly inside `dir` (None if it has none).
+    fn build_dir_matcher(dir: &Path) -> Option<Gitignore> {
+        let mut builder = GitignoreBuilder::new(dir);
+        let mut added = false;
+        for name in DIR_IGNORE_FILES {
+            let file = dir.join(name);
+            if file.is_file() {
+                match builder.add(&file) {
+                    Some(e) => tracing::debug!("Failed to add {}: {}", file.display(), e),
+                    None => added = true,
+                }
+            }
+        }
+        if !added {
+            return None;
+        }
+        builder
+            .build()
+            .map_err(|e| tracing::debug!("Failed to build matcher for {}: {}", dir.display(), e))
+            .ok()
+    }
+
+    /// `path` relative to the root, trying the symlink-resolved root too.
+    fn relative_to_root(&self, path: &Path) -> Option<PathBuf> {
+        path.strip_prefix(&self.root)
+            .ok()
+            .or_else(|| {
+                self.canonical_root
+                    .as_deref()
+                    .and_then(|c| path.strip_prefix(c).ok())
+            })
+            .map(Path::to_path_buf)
+    }
+
+    /// Drop cached rules when an ignore file (or the global one) changes.
+    pub fn note_path_changed(&self, path: &Path) {
+        let is_global = global_codesearchignore_path().is_some_and(|g| g == path);
+        let is_ignore_file = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| DIR_IGNORE_FILES.contains(&n));
+        if !is_global && !is_ignore_file {
+            return;
+        }
+        let parent = path.parent().and_then(|p| self.relative_to_root(p));
+        match parent {
+            Some(rel) if !rel.as_os_str().is_empty() && !is_global => {
+                self.nested
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&self.root.join(rel));
+            }
+            _ => {
+                *self.gitignore.write().unwrap_or_else(|e| e.into_inner()) =
+                    Self::build_gitignore(&self.root);
+            }
         }
     }
 
@@ -233,25 +320,52 @@ impl FileWatcher {
         false
     }
 
-    /// Check if a path is matched by .gitignore rules (relative to repo root).
-    /// Uses `is_dir=true` so directory patterns like `obj/` match files inside them.
+    /// Whether the full walk would skip `path`: hidden components, then nested
+    /// ignore files (deepest first), then root-level rules, then `core.excludesFile`.
     fn is_gitignored(&self, path: &Path) -> bool {
-        if let Some(ref gi) = self.gitignore {
-            let relative = path.strip_prefix(&self.root).unwrap_or(path);
-            // Check each ancestor component with is_dir=true so that
-            // directory-only patterns (e.g. `obj/`) correctly exclude
-            // files nested inside those directories.
-            let mut current = PathBuf::new();
-            for component in relative.components() {
-                current.push(component);
-                if gi.matched(&current, true).is_ignore() {
-                    return true;
+        let Some(rel) = self.relative_to_root(path) else {
+            return false;
+        };
+        let hidden = rel.components().any(|c| {
+            c.as_os_str()
+                .to_str()
+                .is_some_and(|n| n.starts_with('.') && n != "." && n != "..")
+        });
+        if hidden {
+            return true;
+        }
+        let abs = self.root.join(&rel);
+
+        {
+            let mut nested = self.nested.lock().unwrap_or_else(|e| e.into_inner());
+            for ancestor in rel.ancestors().skip(1) {
+                if ancestor.as_os_str().is_empty() {
+                    break;
+                }
+                let dir = self.root.join(ancestor);
+                let matcher = nested
+                    .entry(dir.clone())
+                    .or_insert_with(|| Self::build_dir_matcher(&dir));
+                if let Some(ignored) = matcher
+                    .as_ref()
+                    .and_then(|m| decision(m.matched_path_or_any_parents(&abs, false)))
+                {
+                    return ignored;
                 }
             }
-            false
-        } else {
-            false
         }
+
+        let root_rules = self.gitignore.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(ignored) = root_rules
+            .as_ref()
+            .and_then(|gi| decision(gi.matched_path_or_any_parents(&abs, false)))
+        {
+            return ignored;
+        }
+        // `Gitignore::global()` is rooted at the process cwd: match repo-relative.
+        self.git_global
+            .as_ref()
+            .is_some_and(|gi| gi.matched_path_or_any_parents(&rel, false).is_ignore())
     }
 
     /// Check if a path should be watched.
@@ -318,6 +432,7 @@ impl FileWatcher {
                         for raw_path in &event.paths {
                             // Normalize path: strip UNC prefix, convert backslashes
                             let path = normalize_event_path(raw_path);
+                            self.note_path_changed(&path);
 
                             // Skip ignored directories
                             if self.is_in_ignored_dir(&path) || seen_paths.contains(&path) {
@@ -393,6 +508,7 @@ impl FileWatcher {
                     for raw_path in &event.paths {
                         // Normalize path: strip UNC prefix, convert backslashes
                         let path = normalize_event_path(raw_path);
+                        self.note_path_changed(&path);
 
                         // Skip ignored directories and duplicates
                         if self.is_in_ignored_dir(&path)
@@ -723,7 +839,10 @@ mod tests {
         .unwrap();
 
         let watcher = FileWatcher::new(root.to_path_buf());
-        assert!(watcher.gitignore.is_some(), "Should have loaded .gitignore");
+        assert!(
+            watcher.gitignore.read().unwrap().is_some(),
+            "Should have loaded .gitignore"
+        );
 
         // Should NOT watch (gitignored patterns)
         assert!(
@@ -783,7 +902,7 @@ mod tests {
 
         let watcher = FileWatcher::new(root.to_path_buf());
         assert!(
-            watcher.gitignore.is_some(),
+            watcher.gitignore.read().unwrap().is_some(),
             "Should have loaded .codesearchignore"
         );
 
@@ -808,7 +927,7 @@ mod tests {
         fs::write(root.join(".codesearchignore"), "src/generated/\n").unwrap();
 
         let watcher = FileWatcher::new(root.to_path_buf());
-        assert!(watcher.gitignore.is_some());
+        assert!(watcher.gitignore.read().unwrap().is_some());
 
         // .gitignore pattern takes effect
         assert!(
@@ -840,7 +959,7 @@ mod tests {
 
         let watcher = FileWatcher::new(root.to_path_buf());
         assert!(
-            watcher.gitignore.is_none(),
+            watcher.gitignore.read().unwrap().is_none(),
             "Should have no gitignore matcher when no ignore files exist"
         );
     }
@@ -890,3 +1009,7 @@ mod tests {
         assert!(change.new_commit.is_some());
     }
 }
+
+#[cfg(test)]
+#[path = "ignore_parity_tests.rs"]
+mod ignore_parity_tests;

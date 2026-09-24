@@ -114,6 +114,7 @@ fn memory_pressure() -> Option<MemoryPressure> {
 }
 
 /// macOS `kern.memorystatus_vm_pressure_level`: 1 normal, 2 warn, 4 critical.
+#[cfg(any(target_os = "macos", test))]
 pub fn pressure_from_level(level: i32) -> MemoryPressure {
     match level {
         l if l >= 4 => MemoryPressure::Critical,

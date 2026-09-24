@@ -9,9 +9,10 @@ use dashmap::DashMap;
 use heed::types::*;
 use heed::{Database, EnvOpenOptions};
 use moka::sync::Cache;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 /// Cache for embeddings keyed by chunk hash
 ///
@@ -373,6 +374,33 @@ impl PersistentEmbeddingCache {
     pub fn open(model_name: &str) -> Result<Self> {
         let cache_dir = Self::cache_dir_for(model_name)?;
         Self::open_with_cache_dir(model_name, cache_dir)
+    }
+
+    /// The process-wide cache for `model_name`, shared by every `EmbeddingService`.
+    ///
+    /// An LMDB env can only be opened once per process, so a second private
+    /// open failed and that service ran with no cache at all.
+    pub fn shared(model_name: &str) -> Result<SharedPersistentCache> {
+        Self::shared_at(model_name, Self::cache_dir_for(model_name)?)
+    }
+
+    /// [`Self::shared`] rooted at an explicit `cache_dir` (test seam).
+    pub(crate) fn shared_at(model_name: &str, cache_dir: PathBuf) -> Result<SharedPersistentCache> {
+        static REGISTRY: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<PersistentEmbeddingCache>>>>> =
+            OnceLock::new();
+        let mut open = REGISTRY
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(cache) = open.get(&cache_dir).and_then(Weak::upgrade) {
+            return Ok(cache);
+        }
+        let cache = Arc::new(Mutex::new(Self::open_with_cache_dir(
+            model_name,
+            cache_dir.clone(),
+        )?));
+        open.insert(cache_dir, Arc::downgrade(&cache));
+        Ok(cache)
     }
 
     /// Open a persistent cache rooted at an explicit `cache_dir` (test seam).
@@ -754,6 +782,9 @@ impl Drop for PersistentEmbeddingCache {
         live_cache_stats().remove(&self.model_name);
     }
 }
+
+/// Process-wide handle to a model's persistent cache; the mutex also serializes env resizes.
+pub type SharedPersistentCache = Arc<Mutex<PersistentEmbeddingCache>>;
 
 /// Persistent cache statistics
 #[derive(Debug, Clone)]
@@ -1418,3 +1449,7 @@ mod tests {
         drop(temp_dir);
     }
 }
+
+#[cfg(test)]
+#[path = "cache_shared_tests.rs"]
+mod shared_tests;

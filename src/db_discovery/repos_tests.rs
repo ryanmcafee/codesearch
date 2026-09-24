@@ -294,7 +294,12 @@ fn register_leaves_unix_path_untouched() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("propagate-tmp-repo");
     std::fs::create_dir(&repo).unwrap();
-    let path_str = repo.to_string_lossy().to_string();
+    // macOS tempdirs live under the /var -> /private/var symlink; register()
+    // canonicalizes, so compare against the canonical form.
+    let path_str = safe_canonicalize(&repo)
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
 
     let mut cfg = ReposConfig::default();
     let alias = cfg.register(repo.clone());

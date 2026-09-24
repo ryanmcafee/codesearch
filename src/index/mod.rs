@@ -16,7 +16,10 @@ use crate::fts::FtsStore;
 use crate::vectordb::{merge_metadata_atomic, VectorStore};
 
 // Index manager module
+pub mod executor;
+pub mod governor;
 mod manager;
+mod system_signals;
 pub use manager::{
     is_database_locked, CSharpRebuildNotifier, IndexManager, IndexingStatusCallback, SharedStores,
     SymbolRebuildSignal,
@@ -33,7 +36,7 @@ pub(crate) fn ensure_hnsw_index_if_needed(
     db_path: &Path,
     dimensions: usize,
 ) -> anyhow::Result<bool> {
-    let mut vs = VectorStore::new(db_path, dimensions)?;
+    let vs = VectorStore::new(db_path, dimensions)?;
     match vs.stats() {
         Ok(s) if s.total_chunks > 0 && !s.indexed => {
             vs.build_index()?;
@@ -681,7 +684,7 @@ async fn index_with_options(
         // the metadata was lost/reset. Re-indexing without clearing would create
         // duplicate chunks. Detect and clear before proceeding.
         if file_meta_store.is_empty() {
-            let mut vs = VectorStore::new(&db_path, model_type.dimensions())?;
+            let vs = VectorStore::new(&db_path, model_type.dimensions())?;
             let existing_chunks = vs.stats().map(|s| s.total_chunks).unwrap_or(0);
             if existing_chunks > 0 {
                 log_print!(
@@ -696,7 +699,7 @@ async fn index_with_options(
                 vs.clear()?;
                 drop(vs);
                 // Also clear FTS
-                let mut fts = FtsStore::new_with_writer(&db_path)?;
+                let fts = FtsStore::new_with_writer(&db_path)?;
                 fts.clear()?;
                 drop(fts);
             } else {
@@ -721,7 +724,9 @@ async fn index_with_options(
         }
 
         // Find deleted files (in metadata but not on disk)
-        let deleted_files = file_meta_store.find_deleted_files();
+        let deleted_files = file_meta_store.find_stale_files(&crate::cache::walked_paths(
+            files.iter().map(|f| f.path.as_path()),
+        ));
 
         for (file_path, _chunk_ids) in &deleted_files {
             debug!("🗑️  File deleted from disk: {}", file_path);
@@ -770,8 +775,11 @@ async fn index_with_options(
         if total_chunks_to_delete > 0 {
             log_print!("\n🔄 Deleting {} old chunks...", total_chunks_to_delete);
 
-            let mut store = VectorStore::new(&db_path, model_type.dimensions())?;
-            let mut fts_store = FtsStore::new_with_writer(&db_path)?;
+            let store = VectorStore::new(&db_path, model_type.dimensions())?;
+            let fts_store = FtsStore::new_with_writer(&db_path)?;
+
+            // Collect every stale chunk id so the store publishes ONE write txn.
+            let mut stale_ids: Vec<u32> = Vec::new();
 
             // Delete deleted files' metadata and chunks
             for (file_path, chunk_ids) in deleted_files {
@@ -782,10 +790,7 @@ async fn index_with_options(
                         file_path
                     );
                     debug!("   File path: {}", file_path);
-                    store.delete_chunks(&chunk_ids)?;
-                    for chunk_id in &chunk_ids {
-                        fts_store.delete_chunk(*chunk_id)?;
-                    }
+                    stale_ids.extend(&chunk_ids);
                 }
                 file_meta_store.remove_file(Path::new(&file_path));
             }
@@ -801,11 +806,13 @@ async fn index_with_options(
                         file_path_str
                     );
                     debug!("   File path: {}", file.path.display());
-                    store.delete_chunks(&old_chunk_ids)?;
-                    for chunk_id in &old_chunk_ids {
-                        fts_store.delete_chunk(*chunk_id)?;
-                    }
+                    stale_ids.extend(&old_chunk_ids);
                 }
+            }
+
+            store.delete_chunks(&stale_ids)?;
+            for chunk_id in &stale_ids {
+                fts_store.delete_chunk(*chunk_id)?;
             }
 
             fts_store.commit()?;
@@ -870,10 +877,10 @@ async fn index_with_options(
     }
 
     // Initialize vector store
-    let mut store = VectorStore::new(&db_path, embedding_service.dimensions())?;
+    let store = VectorStore::new(&db_path, embedding_service.dimensions())?;
 
     // Initialize FTS store
-    let mut fts_store = FtsStore::new_with_writer(&db_path)?;
+    let fts_store = FtsStore::new_with_writer(&db_path)?;
 
     // Track chunk IDs per file for metadata (memory efficient: only file paths, not chunk contents)
     let mut file_chunks: std::collections::HashMap<String, Vec<u32>> =
@@ -2846,7 +2853,7 @@ mod index_quality_tests {
 
         // Insert a chunk without calling build_index — simulate cancelled run.
         {
-            let mut vs = VectorStore::new(&db_path, DIMS).unwrap();
+            let vs = VectorStore::new(&db_path, DIMS).unwrap();
             vs.insert_chunks(vec![fake_chunk("foo.rs", DIMS)]).unwrap();
             // Deliberately do NOT call vs.build_index()
             let s = vs.stats().unwrap();
@@ -2879,7 +2886,7 @@ mod index_quality_tests {
         const DIMS: usize = 4;
 
         {
-            let mut vs = VectorStore::new(&db_path, DIMS).unwrap();
+            let vs = VectorStore::new(&db_path, DIMS).unwrap();
             vs.insert_chunks(vec![fake_chunk("bar.rs", DIMS)]).unwrap();
             vs.build_index().unwrap();
             assert!(vs.is_indexed(), "precondition: already indexed");

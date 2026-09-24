@@ -62,7 +62,7 @@ fn build_db_child() {
         eprintln!("skip: {BUILD_DB_ENV} not set — this helper is driven by the parent test");
         return;
     };
-    let mut store = VectorStore::new(std::path::Path::new(&path), 4).expect("create store");
+    let store = VectorStore::new(std::path::Path::new(&path), 4).expect("create store");
     store.insert_chunks(sample_chunks()).expect("insert chunks");
     store.build_index().expect("build index");
     assert!(store.is_indexed());

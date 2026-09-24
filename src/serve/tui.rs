@@ -788,7 +788,8 @@ fn build_info_overlay(
 
     // If stores are open, get live stats (overrides metadata)
     if let Some(stores) = state.get_opened_stores(alias) {
-        if let Ok(vs) = stores.vector_store.try_read() {
+        {
+            let vs = &stores.vector_store;
             if let Ok(live_stats) = vs.stats() {
                 chunks = live_stats.total_chunks;
                 files = live_stats.total_files;
@@ -954,9 +955,8 @@ fn spawn_doctor(
             let stores = state.get_or_open_stores(&alias, true).await;
             match stores {
                 Ok(s) => {
-                    let vs = s.vector_store.read().await;
-                    let report = doctor::diagnose_with_store(&project_path, &vs);
-                    drop(vs);
+                    let vs = &s.vector_store;
+                    let report = doctor::diagnose_with_store(&project_path, vs);
                     match report {
                         Ok(r) => OverlayState::Doctor {
                             alias,
@@ -1162,12 +1162,15 @@ pub(crate) fn spawn_force_reindex(alias: String, state: &Arc<ServeState>) -> Rei
             alias_bg
         );
 
-        match IndexManager::force_reindex_with_stores(
-            &project_path,
-            &db_path,
-            &stores,
-            None,
-            &reindex_token_task,
+        match crate::index::governor::with_priority(
+            crate::index::governor::IndexPriority::Explicit,
+            IndexManager::force_reindex_with_stores(
+                &project_path,
+                &db_path,
+                &stores,
+                None,
+                &reindex_token_task,
+            ),
         )
         .await
         {

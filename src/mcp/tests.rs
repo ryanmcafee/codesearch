@@ -2683,7 +2683,7 @@ async fn require_ready_reads_live_stores_and_rejects_partial_metadata() {
     let db_path = root.path().join(".codesearch.db");
     let stores = crate::index::SharedStores::new(&db_path, 2).expect("shared stores");
     {
-        let mut vector_store = stores.vector_store.write().await;
+        let vector_store = &stores.vector_store;
         let chunk = crate::chunker::Chunk::new(
             "fn ready() {}".to_string(),
             0,
@@ -2700,7 +2700,7 @@ async fn require_ready_reads_live_stores_and_rejects_partial_metadata() {
         vector_store.build_index().expect("build vector index");
     }
     {
-        let mut fts_store = stores.fts_store.write().await;
+        let fts_store = &stores.fts_store;
         fts_store
             .add_chunk(0, "fn ready() {}", "src/lib.rs", None, "Function")
             .expect("insert FTS document");

@@ -188,7 +188,7 @@ async fn main() -> Result<()> {
     print_section("Phase 4: Vector Storage (NEW!)");
 
     println!("🔄 Creating vector database...");
-    let mut store = VectorStore::new(db_path, embedding_service.dimensions())?;
+    let store = VectorStore::new(db_path, embedding_service.dimensions())?;
 
     println!("✅ Database opened: {}", db_path.display());
 

@@ -286,3 +286,96 @@ async fn jobs_for_the_same_repo_never_overlap() {
     first.await.unwrap();
     same.await.unwrap();
 }
+
+fn events_for(label: &str) -> Vec<(crate::health::EventLevel, String)> {
+    crate::health::log()
+        .recent(crate::health::MAX_EVENTS)
+        .into_iter()
+        .rev()
+        .filter(|e| e.repo.as_deref() == Some(label))
+        .map(|e| (e.level, e.msg))
+        .collect()
+}
+
+#[tokio::test]
+async fn run_job_records_the_outcome_by_label() {
+    use crate::health::EventLevel::*;
+    let gov = governor(calm);
+    let label = "/governor-test/run-job";
+
+    let live = CancellationToken::new();
+    let failed: Result<(), anyhow::Error> = gov
+        .run_job(label, &live, async {
+            Err(anyhow::anyhow!("disk full").context("writing chunks"))
+        })
+        .await;
+    assert!(failed.is_err());
+    let outcome = crate::health::log().outcomes()[label].clone();
+    assert_eq!(outcome.failures, 1);
+    assert_eq!(outcome.error.as_deref(), Some("writing chunks: disk full"));
+
+    let ok: Result<u8, anyhow::Error> = gov.run_job(label, &live, async { Ok(3) }).await;
+    assert_eq!(ok.unwrap(), 3);
+    assert_eq!(crate::health::log().outcomes()[label].failures, 0);
+
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    let _: Result<(), anyhow::Error> = gov
+        .run_job(label, &cancelled, async {
+            Err(anyhow::anyhow!("indexing cancelled"))
+        })
+        .await;
+    assert_eq!(
+        crate::health::log().outcomes()[label].failures,
+        0,
+        "cancellation is not a failure"
+    );
+    assert_eq!(
+        events_for(label),
+        [
+            (
+                Error,
+                "index job failed: writing chunks: disk full".to_string()
+            ),
+            (Info, "index job finished".to_string()),
+            (Info, "index job cancelled".to_string()),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn pausing_and_resuming_are_logged_once_each() {
+    use crate::health::EventLevel::*;
+    let slow_until = Arc::new(AtomicU64::new(2));
+    let gov = {
+        let slow_until = Arc::clone(&slow_until);
+        governor(move || {
+            if slow_until.load(Ordering::SeqCst) > 0 {
+                slow_until.fetch_sub(1, Ordering::SeqCst);
+                GateInputs {
+                    recent_read_max_ms: Some(4_000),
+                    ..calm()
+                }
+            } else {
+                calm()
+            }
+        })
+    };
+    let label = "/governor-test/pause";
+    gov.run_exclusive(label, async {}).await;
+
+    let events = events_for(label);
+    assert_eq!(events.len(), 2, "{events:?}");
+    assert_eq!(
+        events[0],
+        (
+            Warn,
+            "indexing paused: a tool call took 4000ms (target 1000ms)".to_string()
+        )
+    );
+    assert_eq!(events[1].0, Info);
+    assert!(
+        events[1].1.starts_with("indexing resumed after "),
+        "{events:?}"
+    );
+}

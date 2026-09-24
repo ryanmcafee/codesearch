@@ -9,6 +9,7 @@ pub mod error;
 pub mod federation;
 pub mod file;
 pub mod fts;
+pub mod health;
 pub mod index;
 pub mod lmdb_registry;
 pub mod logger;

@@ -87,7 +87,7 @@ Five tools exposed to agents:
 | `find` | Symbol navigation: definition, usages, imports, dependents. Requires scope. |
 | `explore` | File outline or similar-chunk lookup. Requires scope. |
 | `get_chunk` | Retrieve a chunk by ID with optional context lines. Requires `project` in multi-repo mode. |
-| `status` | Index and project status. Lightweight (no DB open) when called without scope. |
+| `status` | Index and project status. Lightweight (no DB open) when called without scope. `kind="health"\|"latency"\|"repos"\|"events"` return serve health (same builders as `/api/*`). |
 
 All tools return `scope_required` structured errors in multi-repo mode when no `project`
 or `group` is specified, with `available_projects`, `available_groups`, and `hint_for_agent`.
@@ -128,6 +128,11 @@ Without TTY: headless, logs only.
 | `/repos/:alias` | DELETE | Stop FSW, evict, unregister, delete DB |
 | `/repos/:alias/reindex` | POST | Incremental or force reindex (background) |
 | `/mcp` | GET/POST | MCP streamable HTTP endpoint |
+| `/dashboard` | GET | Health dashboard page (`src/serve/dashboard.html`, embedded) |
+| `/api/summary` | GET | ok/degraded + reasons, latency 5m/1h, governor, QoS, repo counts |
+| `/api/latency` | GET | Bucketed tool-call latency (`hours`, `bucket_minutes`) |
+| `/api/repos` | GET | Per-repo index health (`q`, `status`) |
+| `/api/events` | GET | Recent index/governor events (`limit`) |
 
 ## Supported languages
 
@@ -210,7 +215,7 @@ TUI `i` overlay. The TUI discovery tick is config-only (zero HTTP).
 ### LMDB rules
 
 - **Readers take no app lock.** `SharedStores` holds `Arc<VectorStore>` / `Arc<FtsStore>`; writes serialize inside each store. A mutation on an indexed store must publish data and HNSW build in the SAME write txn (`replace_chunks`) — never commit inserts and build later, or readers see NeedBuild.
-- **Index work runs on `index::executor`** (`spawn_index_blocking`), never on tokio workers or `tokio::task::spawn_blocking`; index jobs enter through `index::governor::run_exclusive` and call `yield_to_reads()` between batches.
+- **Index work runs on `index::executor`** (`spawn_index_blocking`), never on tokio workers or `tokio::task::spawn_blocking`; index jobs enter through `index::governor::run_job` (records the outcome in `health::log()`, which the dashboard reads) and call `yield_to_reads()` between batches.
 - **One `EnvOpenOptions::open()` per directory per process.** All access via `get_or_open_stores()` → `Arc<SharedStores>`; SCIP opens share a per-directory env (`get_or_open_shared_env`).
 - **Open every env with `BASE_ENV_FLAGS`** (`src/lmdb_registry.rs`) — heed refuses to reopen one path with different options.
 - **Commit, never drop, a txn whose DB handle you keep** — an aborted txn's DBI is closed by LMDB; using it later yields a bare `EINVAL`.
@@ -243,7 +248,7 @@ Never `unwrap_or_default()` a store error on a search path — "no results" and 
 
 ## Changelog highlights (recent)
 
-- **v1.4.10** — read path isolated from indexing: lock-free snapshot reads with atomic `replace_chunks` publishes, a background-QoS indexing pool, an in-process indexing governor that yields to slow tool calls, tool-call p50..p100 in `/status` / `status(kind="health")`, and watcher ignore parity with the full walk
+- **v1.4.10** — read path isolated from indexing: lock-free snapshot reads with atomic `replace_chunks` publishes, a background-QoS indexing pool, an in-process indexing governor that yields to slow tool calls, tool-call p50..p100 in `/status` / `status(kind="health")`, and watcher ignore parity with the full walk; health dashboard at `/dashboard` with `/api/{summary,latency,repos,events}` and matching `status` kinds
 - **v1.4.4** — resident C# workspace pool no longer serves stale `find_impact` results after a rebuild: `WorkspacePool::evict` bumps a per-solution generation counter closing a spawn-in-flight race, and `scip_ref_cache` is now cleared unconditionally on both full and incremental rebuilds
 - **v1.3.37** — per-index embedding models end-to-end: serve queries, `POST /repos` and CLI index/stats/status honour the model each index records in its `metadata.json`; `serve --model` sets the default for newly created indexes; unrecorded indexes are queried with the built-in model plus a caller-facing warning; mid-rebuild indexes no longer report ready (PR #248)
 - **v1.3.23–v1.3.36** — dependency + platform wave: rmcp 3.3, fastembed 6.1 + ort rc.13, tantivy 0.26, axum 0.8, ratatui 0.30 + crossterm 0.29, thiserror 2, notify 8, tree-sitter 0.27, dirs/sha2/scip/sysinfo refresh + dependabot (weekly); clears the open Aikido/RUSTSEC advisories

@@ -8,6 +8,7 @@ mod embed;
 mod federation;
 mod file;
 mod fts;
+mod health;
 mod index;
 mod lmdb_registry;
 mod logger;

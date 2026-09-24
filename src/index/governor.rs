@@ -8,6 +8,9 @@ use std::future::Future;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
+
+use crate::health::EventLevel;
 
 /// Who asked for the work; higher runs first and yields later.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -140,6 +143,7 @@ struct Job {
     priority: IndexPriority,
     since: Instant,
     paused: Option<String>,
+    paused_since: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -249,6 +253,37 @@ impl IndexGovernor {
             .await
     }
 
+    /// [`Self::run_exclusive`] for an index job: records its outcome in
+    /// [`crate::health::log`], keyed by `label`. An error after `cancel` fired
+    /// is logged as cancelled, not counted as a failure.
+    pub async fn run_job<T, E: std::fmt::Display>(
+        &self,
+        label: &str,
+        cancel: &CancellationToken,
+        fut: impl Future<Output = Result<T, E>>,
+    ) -> Result<T, E> {
+        if JOB_ID.try_with(|_| ()).is_ok() {
+            return fut.await;
+        }
+        self.run_exclusive(label, async {
+            let started = Instant::now();
+            let result = fut.await;
+            let log = crate::health::log();
+            match &result {
+                Err(_) if cancel.is_cancelled() => {
+                    log.event(EventLevel::Info, "index job cancelled", Some(label))
+                }
+                _ => log.job_finished(
+                    label,
+                    started.elapsed(),
+                    result.as_ref().map(|_| ()).map_err(|e| format!("{e:#}")),
+                ),
+            }
+            result
+        })
+        .await
+    }
+
     async fn admit(&self, label: &str, priority: IndexPriority) -> u64 {
         let id = {
             let mut state = self.lock();
@@ -260,6 +295,7 @@ impl IndexGovernor {
                 priority,
                 since: Instant::now(),
                 paused: None,
+                paused_since: None,
             });
             id
         };
@@ -271,10 +307,12 @@ impl IndexGovernor {
                 let overdue = Instant::now() >= deadline;
                 if state.may_start(id, self.max_jobs) || overdue {
                     if overdue {
-                        tracing::warn!(
-                            "index job '{label}' waited {:?} for a slot; starting anyway",
+                        let msg = format!(
+                            "index job waited {:?} for a slot; starting anyway",
                             self.waits.of(priority)
                         );
+                        tracing::warn!("{msg}: {label}");
+                        crate::health::log().event(EventLevel::Warn, msg, Some(label));
                     }
                     let pos = state.waiting.iter().position(|j| j.id == id).unwrap_or(0);
                     let mut job = state.waiting.remove(pos);
@@ -299,10 +337,12 @@ impl IndexGovernor {
             self.set_paused(job, reason.clone());
             let Some(reason) = reason else { return };
             if started.elapsed() >= self.waits.of(priority) {
-                tracing::warn!(
+                let msg = format!(
                     "indexing paused {:?} ({reason}); continuing to avoid starvation",
                     self.waits.of(priority)
                 );
+                tracing::warn!("{msg}");
+                crate::health::log().event(EventLevel::Warn, msg, self.label_of(job).as_deref());
                 self.set_paused(job, None);
                 return;
             }
@@ -310,10 +350,41 @@ impl IndexGovernor {
         }
     }
 
+    fn label_of(&self, job: Option<u64>) -> Option<String> {
+        let id = job?;
+        let state = self.lock();
+        state
+            .running
+            .iter()
+            .find(|j| j.id == id)
+            .map(|j| j.label.clone())
+    }
+
+    /// Update a running job's pause reason, logging pause and resume transitions.
     fn set_paused(&self, job: Option<u64>, reason: Option<String>) {
         let Some(id) = job else { return };
-        if let Some(j) = self.lock().running.iter_mut().find(|j| j.id == id) {
+        let transition = {
+            let mut state = self.lock();
+            let Some(j) = state.running.iter_mut().find(|j| j.id == id) else {
+                return;
+            };
+            let transition = match (&j.paused_since, &reason) {
+                (None, Some(reason)) => {
+                    j.paused_since = Some(Instant::now());
+                    Some((EventLevel::Warn, format!("indexing paused: {reason}")))
+                }
+                (Some(since), None) => {
+                    let msg = format!("indexing resumed after {}s", since.elapsed().as_secs());
+                    j.paused_since = None;
+                    Some((EventLevel::Info, msg))
+                }
+                _ => None,
+            };
             j.paused = reason;
+            transition.map(|(level, msg)| (level, msg, j.label.clone()))
+        };
+        if let Some((level, msg, label)) = transition {
+            crate::health::log().event(level, msg, Some(&label));
         }
     }
 

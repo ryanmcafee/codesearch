@@ -14,10 +14,12 @@ pub mod lmdb_registry;
 pub mod logger;
 pub mod mcp;
 pub mod output;
+pub mod qos;
 pub mod rerank;
 pub mod search;
 pub mod serve;
 pub mod symbols;
+pub mod telemetry;
 #[cfg(test)]
 pub mod testing;
 pub mod utils;

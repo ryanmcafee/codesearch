@@ -841,7 +841,7 @@ impl CodesearchService {
         warnings: &mut Vec<String>,
     ) -> Option<crate::vectordb::SearchResult> {
         for (idx, store_arc) in stores.iter().enumerate() {
-            let store = store_arc.vector_store.read().await;
+            let store = &store_arc.vector_store;
             let looked_up = store.get_chunk(chunk_id);
             if let Err(ref e) = looked_up {
                 note_store_failure(warnings, aliases, idx, "chunk lookup", e);
@@ -880,7 +880,7 @@ impl CodesearchService {
         let mut results = Vec::new();
         for fts in fts_results.iter().take(limit) {
             for (idx, store_arc) in stores.iter().enumerate() {
-                let store = store_arc.vector_store.read().await;
+                let store = &store_arc.vector_store;
                 let looked_up = store.get_chunk(fts.chunk_id);
                 if let Err(ref e) = looked_up {
                     // `Ok(None)` means "this store does not hold that chunk" and

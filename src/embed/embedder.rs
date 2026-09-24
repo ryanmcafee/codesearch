@@ -319,6 +319,18 @@ impl FastEmbedder {
         model_type: ModelType,
         cache_dir: Option<&std::path::Path>,
     ) -> Result<Self> {
+        Self::with_threads(model_type, cache_dir, None)
+    }
+
+    /// Like [`Self::with_cache_dir`] with a fixed ONNX intra-op thread count.
+    ///
+    /// `Some(1)` runs every op on the calling thread, which keeps inference at
+    /// that thread's QoS (ORT's own pool threads would not inherit it).
+    pub fn with_threads(
+        model_type: ModelType,
+        cache_dir: Option<&std::path::Path>,
+        intra_threads: Option<usize>,
+    ) -> Result<Self> {
         // Set cache directory via environment variable if provided
         // Note: fastembed library uses FASTEMBED_CACHE_DIR (not FASTEMBED_CACHE_PATH)
         if let Some(cache_dir) = cache_dir {
@@ -332,12 +344,14 @@ impl FastEmbedder {
         // Arena allocator provides fast memory reuse during inference.
         let cpu_ep = CPU::default().with_arena_allocator(true).build();
 
-        let model = TextEmbedding::try_new(
-            TextInitOptions::new(model_type.to_fastembed_model())
-                .with_show_download_progress(false)
-                .with_execution_providers(vec![cpu_ep]),
-        )
-        .map_err(|e| anyhow!("Failed to initialize embedding model: {}", e))?;
+        let mut options = TextInitOptions::new(model_type.to_fastembed_model())
+            .with_show_download_progress(false)
+            .with_execution_providers(vec![cpu_ep]);
+        if let Some(threads) = intra_threads {
+            options = options.with_intra_threads(threads);
+        }
+        let model = TextEmbedding::try_new(options)
+            .map_err(|e| anyhow!("Failed to initialize embedding model: {}", e))?;
 
         Ok(Self { model, model_type })
     }

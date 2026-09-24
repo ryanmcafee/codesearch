@@ -67,7 +67,10 @@ else
     echo ""
     echo "Running QC gate (mirrors CI)..."
     echo ""
-    if ! pwsh -NoProfile -File "$REPO/scripts/qc.ps1" -Fast; then
+    # git exports GIT_DIR (and friends) to hooks; tests that shell out to git
+    # would otherwise commit into, and reconfigure, this repository.
+    if ! env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_PREFIX -u GIT_COMMON_DIR \
+        pwsh -NoProfile -File "$REPO/scripts/qc.ps1" -Fast; then
         echo ""
         echo "QC gate FAILED. Push blocked."
         echo "  Fix the errors above, or use 'git push --no-verify' to skip."

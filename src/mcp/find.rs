@@ -159,7 +159,7 @@ impl CodesearchService {
             let mut items: Vec<ReferenceItem> = Vec::new();
             'outer: for fts_result in &fts_results {
                 for (store_idx, store_arc) in sv.iter().enumerate() {
-                    let store = store_arc.vector_store.read().await;
+                    let store = &store_arc.vector_store;
                     let looked_up = store.get_chunk(fts_result.chunk_id);
                     if let Err(ref e) = looked_up {
                         // `Ok(None)` = chunk not in this store (normal during
@@ -354,7 +354,7 @@ impl CodesearchService {
             let mut items: Vec<ReferenceItem> = Vec::new();
             for fts_result in &fts_results {
                 for (store_idx, store_arc) in sv.iter().enumerate() {
-                    let store = store_arc.vector_store.read().await;
+                    let store = &store_arc.vector_store;
                     let looked_up = store.get_chunk(fts_result.chunk_id);
                     if let Err(ref e) = looked_up {
                         // Same rule as find_definition: `Err` is a broken

@@ -569,8 +569,7 @@ pub(crate) async fn rest_find_impact_handler(
     axum::Json(req): axum::Json<FindImpactRequest>,
 ) -> Result<axum::response::Json<serde_json::Value>, super::RestError> {
     let service = super::make_service(&state)?;
-    let result = service
-        .find_impact(Parameters(req))
+    let result = crate::telemetry::timed("find_impact", service.find_impact(Parameters(req)))
         .await
         .map_err(super::mcp_err_to_http)?;
     Ok(axum::Json(super::call_tool_result_to_json(result)))

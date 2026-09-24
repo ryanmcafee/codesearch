@@ -942,13 +942,7 @@ async fn add_repo_handler_uses_serve_default_model_for_new_index() {
     let stores = state
         .get_opened_stores("defaulted")
         .expect("store must be open immediately after add");
-    let dims = stores
-        .vector_store
-        .try_read()
-        .unwrap()
-        .stats()
-        .unwrap()
-        .dimensions;
+    let dims = stores.vector_store.stats().unwrap().dimensions;
     assert_eq!(
         dims,
         crate::embed::ModelType::EmbeddingGemma300MQ4.dimensions(),
@@ -1001,13 +995,7 @@ async fn add_repo_handler_keeps_recorded_model_over_serve_default() {
     let stores = state
         .get_opened_stores("existing")
         .expect("store must be open immediately after add");
-    let dims = stores
-        .vector_store
-        .try_read()
-        .unwrap()
-        .stats()
-        .unwrap()
-        .dimensions;
+    let dims = stores.vector_store.stats().unwrap().dimensions;
     assert_eq!(
         dims,
         crate::embed::ModelType::AllMiniLML6V2Q.dimensions(),
@@ -2881,8 +2869,6 @@ async fn try_open_stores_honours_dimension_override_for_a_fresh_repo() {
 
     let dims = stores
         .vector_store
-        .read()
-        .await
         .stats()
         .expect("stats on a freshly created store")
         .dimensions;
@@ -3102,4 +3088,15 @@ async fn self_clean_keeps_the_db_dir_of_a_still_registered_repo() {
         !db_path.exists(),
         "an unregistered alias's orphaned DB dir must still be cleaned up"
     );
+}
+
+#[tokio::test]
+async fn status_reports_the_indexing_pool_qos() {
+    let qos = qos_status_json();
+    assert!(
+        ["background", "utility", "user-initiated"].contains(&qos["index"].as_str().unwrap()),
+        "{qos}"
+    );
+    assert!(qos["index_threads"].as_u64().unwrap() >= 1, "{qos}");
+    assert!(qos.get("read").is_some(), "{qos}");
 }

@@ -2346,7 +2346,7 @@ impl ServeState {
         // twice, or the loser trips the LMDB double-open guard and the repo
         // wedges as an incurable Conflicted (todo #131).
         let open_lock = self.open_lock(alias);
-        let _open_guard = open_lock.lock().await;
+        let open_guard = open_lock.lock().await;
         if let Some(entry) = self.repos.get(alias) {
             match entry.value() {
                 RepoState::Write { .. } | RepoState::Warm { .. } | RepoState::Readonly { .. } => {
@@ -2386,7 +2386,7 @@ impl ServeState {
                 // `index_health()` (not `stats()`) on purpose: this arm is the
                 // cheap path that keeps the 2 GiB replica alive, and `stats()`
                 // would deserialize every chunk just to count unique paths.
-                match stores.vector_store.read().await.index_health() {
+                match stores.vector_store.index_health() {
                     Ok((total_chunks, false)) if total_chunks > 0 => warn!(
                         "Warmup '{}': opened READ-ONLY but its vector index has no HNSW graph \
                          ({} chunks present). Semantic search will return 0 results for this \
@@ -2418,7 +2418,7 @@ impl ServeState {
         // exactly `(total_chunks, indexed)` and `stats()` would deserialize
         // every chunk in the store just to count unique file paths.
         let needs_build = {
-            let vstore = stores.vector_store.read().await;
+            let vstore = &stores.vector_store;
             match vstore.index_health() {
                 Ok((total_chunks, false)) if total_chunks > 0 => Some(total_chunks),
                 Ok(_) => None,
@@ -2434,11 +2434,8 @@ impl ServeState {
                 alias, total_chunks
             );
             let vector_store = Arc::clone(&stores.vector_store);
-            match tokio::task::spawn_blocking(move || {
-                let mut vstore = vector_store.blocking_write();
-                vstore.build_index()
-            })
-            .await
+            match crate::index::executor::spawn_index_blocking(move || vector_store.build_index())
+                .await
             {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
@@ -2452,6 +2449,20 @@ impl ServeState {
         }
 
         let stores_arc = stores;
+
+        // Publish as Warm and release the open lock BEFORE the refresh: queries
+        // read the committed snapshot while the (governed, possibly queued)
+        // refresh runs, instead of waiting on `open_lock` for its duration.
+        // Start the idle timer here too: warmed-but-never-queried repos must
+        // appear in `last_access` or `evict_idle_repos` never releases them.
+        self.repos.insert(
+            alias.to_string(),
+            RepoState::Warm {
+                stores: Arc::clone(&stores_arc),
+            },
+        );
+        self.touch_access(alias);
+        drop(open_guard);
 
         // Warmup runs at startup (pre-warm), never in response to a user action,
         // so it is given a fresh token that is never cancelled — the refresh runs
@@ -2468,15 +2479,6 @@ impl ServeState {
             tracing::warn!("Warmup '{}': incremental refresh failed: {}", alias, e);
         }
 
-        // Store as Warm — FSW will be started lazily on first query.
-        self.repos
-            .insert(alias.to_string(), RepoState::Warm { stores: stores_arc });
-
-        // Start the idle timer at warmup. A real query will reset it via
-        // touch_access; without this, repos that are warmed but never queried
-        // would never appear in `last_access` and therefore never be evicted
-        // by `evict_idle_repos`, holding LMDB envs and embedder state forever.
-        self.touch_access(alias);
         Ok(())
     }
 
@@ -2595,8 +2597,8 @@ impl ServeState {
         {
             let vector_store = Arc::clone(&stores.vector_store);
             let alias_owned = alias.to_string();
-            match tokio::task::spawn_blocking(move || {
-                let mut vstore = vector_store.blocking_write();
+            match crate::index::executor::spawn_index_blocking(move || {
+                let vstore = &vector_store;
                 // `index_health()`, not `stats()` — the predicate needs exactly
                 // `(total_chunks, indexed)`, while `stats()` deserializes every
                 // ChunkMetadata in the store just to count unique file paths.
@@ -3728,7 +3730,21 @@ async fn status_handler(
         "csharp_helper": csharp_helper,
         "ts_helper": ts_helper,
         "uptime_secs": uptime_secs,
+        "qos": qos_status_json(),
+        "latency": crate::telemetry::reads()
+            .summary_at(std::time::Instant::now(), crate::telemetry::RETENTION),
+        "index_governor": crate::index::governor::global().status(),
     }))
+}
+
+/// Scheduling classes in effect: `read` is the calling (tool-serving) thread.
+fn qos_status_json() -> serde_json::Value {
+    let pool = crate::index::executor::global();
+    json!({
+        "read": crate::qos::current_thread().map(crate::qos::ThreadQos::as_str),
+        "index": pool.qos().as_str(),
+        "index_threads": pool.threads(),
+    })
 }
 
 /// Projection of a federation peer that is safe to expose over `GET /remotes`.
@@ -3847,7 +3863,8 @@ async fn info_handler(
 
     // If stores are open, live stats override metadata.
     if let Some(stores) = state.get_opened_stores(&alias) {
-        if let Ok(vs) = stores.vector_store.try_read() {
+        {
+            let vs = &stores.vector_store;
             if let Ok(live_stats) = vs.stats() {
                 chunks = live_stats.total_chunks;
                 files = live_stats.total_files;
@@ -3923,8 +3940,8 @@ async fn doctor_handler(
     let pp = project_path.clone();
     let report = tokio::task::spawn_blocking(move || match opened {
         Some(stores) => {
-            let vs = stores.vector_store.blocking_read();
-            crate::cli::doctor::diagnose_with_store(&pp, &vs)
+            let vs = &stores.vector_store;
+            crate::cli::doctor::diagnose_with_store(&pp, vs)
         }
         None => crate::cli::doctor::diagnose(&pp),
     })
@@ -4282,12 +4299,15 @@ async fn reindex_handler(
             );
 
             // 2. Clear data and reindex
-            match IndexManager::force_reindex_with_stores(
-                &project_path,
-                &db_path,
-                &stores,
-                None,
-                &reindex_token_task,
+            match crate::index::governor::with_priority(
+                crate::index::governor::IndexPriority::Explicit,
+                IndexManager::force_reindex_with_stores(
+                    &project_path,
+                    &db_path,
+                    &stores,
+                    None,
+                    &reindex_token_task,
+                ),
             )
             .await
             {
@@ -4370,11 +4390,14 @@ async fn reindex_handler(
                 "🔄 Incremental reindex triggered for '{}' via HTTP API",
                 alias_bg
             );
-            match IndexManager::perform_incremental_refresh_with_stores(
-                &project_path,
-                &db_path,
-                &stores,
-                &reindex_token_task,
+            match crate::index::governor::with_priority(
+                crate::index::governor::IndexPriority::Explicit,
+                IndexManager::perform_incremental_refresh_with_stores(
+                    &project_path,
+                    &db_path,
+                    &stores,
+                    &reindex_token_task,
+                ),
             )
             .await
             {
@@ -4688,12 +4711,15 @@ async fn add_repo_handler(
             project_path.display()
         );
 
-        match IndexManager::force_reindex_with_stores(
-            &project_path,
-            &db_path,
-            &stores,
-            model_override,
-            &token_for_task,
+        match crate::index::governor::with_priority(
+            crate::index::governor::IndexPriority::Explicit,
+            IndexManager::force_reindex_with_stores(
+                &project_path,
+                &db_path,
+                &stores,
+                model_override,
+                &token_for_task,
+            ),
         )
         .await
         {
@@ -4750,11 +4776,8 @@ async fn add_repo_handler(
         {
             let vector_store = Arc::clone(&stores.vector_store);
             let alias_bi = alias_bg.clone();
-            match tokio::task::spawn_blocking(move || {
-                let mut vstore = vector_store.blocking_write();
-                vstore.build_index()
-            })
-            .await
+            match crate::index::executor::spawn_index_blocking(move || vector_store.build_index())
+                .await
             {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {

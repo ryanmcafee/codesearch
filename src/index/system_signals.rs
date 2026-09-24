@@ -44,7 +44,7 @@ impl Sampler {
         }
         let inputs = GateInputs {
             recent_read_max_ms,
-            memory_pressure: memory_pressure(),
+            memory_pressure: self.memory_pressure(),
             other_cpu_percent: self.other_cpu_percent(),
             on_battery: if want_battery {
                 self.on_battery(now)
@@ -78,6 +78,17 @@ impl Sampler {
         Some((self.system.global_cpu_usage() - own).max(0.0))
     }
 
+    #[cfg(target_os = "macos")]
+    fn memory_pressure(&mut self) -> Option<MemoryPressure> {
+        memory_pressure()
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn memory_pressure(&mut self) -> Option<MemoryPressure> {
+        self.system.refresh_memory();
+        pressure_from_available(self.system.available_memory(), self.system.total_memory())
+    }
+
     fn on_battery(&mut self, now: Instant) -> Option<bool> {
         if let Some((at, value)) = self.battery {
             if now.duration_since(at) < BATTERY_EVERY {
@@ -108,11 +119,6 @@ fn memory_pressure() -> Option<MemoryPressure> {
     (rc == 0).then(|| pressure_from_level(level))
 }
 
-#[cfg(not(target_os = "macos"))]
-fn memory_pressure() -> Option<MemoryPressure> {
-    None
-}
-
 /// macOS `kern.memorystatus_vm_pressure_level`: 1 normal, 2 warn, 4 critical.
 #[cfg(any(target_os = "macos", test))]
 pub fn pressure_from_level(level: i32) -> MemoryPressure {
@@ -121,6 +127,20 @@ pub fn pressure_from_level(level: i32) -> MemoryPressure {
         2 | 3 => MemoryPressure::Warn,
         _ => MemoryPressure::Normal,
     }
+}
+
+/// Available-memory share below 10% warns and below 5% is critical.
+#[cfg(any(not(target_os = "macos"), test))]
+pub fn pressure_from_available(available: u64, total: u64) -> Option<MemoryPressure> {
+    if total == 0 {
+        return None;
+    }
+    let percent = available.saturating_mul(100) / total;
+    Some(match percent {
+        p if p < 5 => MemoryPressure::Critical,
+        p if p < 10 => MemoryPressure::Warn,
+        _ => MemoryPressure::Normal,
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -152,6 +172,30 @@ mod tests {
         for (level, expected) in cases {
             assert_eq!(pressure_from_level(level), expected, "level {level}");
         }
+    }
+
+    #[test]
+    fn available_memory_share_maps_to_classes() {
+        let cases = [
+            (0, 0, None),
+            (4, 100, Some(MemoryPressure::Critical)),
+            (5, 100, Some(MemoryPressure::Warn)),
+            (9, 100, Some(MemoryPressure::Warn)),
+            (10, 100, Some(MemoryPressure::Normal)),
+            (100, 100, Some(MemoryPressure::Normal)),
+        ];
+        for (available, total, expected) in cases {
+            assert_eq!(
+                pressure_from_available(available, total),
+                expected,
+                "{available}/{total}"
+            );
+        }
+    }
+
+    #[test]
+    fn sampler_reports_memory_pressure() {
+        assert!(Sampler::default().memory_pressure().is_some());
     }
 
     #[cfg(target_os = "macos")]

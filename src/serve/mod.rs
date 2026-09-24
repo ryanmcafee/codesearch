@@ -10,6 +10,7 @@
 //! Holds a `DashMap<String, Arc<SharedStores>>` keyed by repo alias.
 //! Lazy-opens stores on first query. Conflicted repos are isolated.
 
+pub(crate) mod dashboard;
 mod tui;
 mod tui_common;
 mod tui_remote;
@@ -35,13 +36,14 @@ use tracing::{info, warn};
 
 use crate::cache::safe_canonicalize;
 use crate::constants::{
-    ALLOWED_HOSTS_ENV, ALLOWED_ROOTS_ENV, CHUNK_PATH, CSHARP_PREWARM_ENABLED_ENV,
-    CSHARP_PREWARM_MAX_SYMBOLS, CSHARP_SCIP_CONCURRENCY_DEFAULT, CSHARP_SCIP_CONCURRENCY_ENV,
-    DB_DIR_NAME, DEFAULT_SERVE_PORT, DISABLE_HOST_VALIDATION_ENV, EXPLORE_PATH, FIND_IMPACT_PATH,
-    FIND_PATH, HEALTHZ_PATH, HEALTH_PATH, INDEXING_PATH, LANG_CSHARP, LANG_TYPESCRIPT,
-    MAX_INDEXING_SECS, MAX_INDEXING_SECS_ENV, MCP_ENDPOINT_PATH, PERSIST_DEBOUNCE_SECS,
-    REAPER_INTERVAL_SECS, REMOTES_PATH, REPO_IDLE_TIMEOUT_ENV, REPO_IDLE_TIMEOUT_SECS, SEARCH_PATH,
-    SERVE_API_KEY_ENV, SERVE_PORT_ENV, STATUS_PATH,
+    ALLOWED_HOSTS_ENV, ALLOWED_ROOTS_ENV, API_EVENTS_PATH, API_LATENCY_PATH, API_REPOS_PATH,
+    API_SUMMARY_PATH, CHUNK_PATH, CSHARP_PREWARM_ENABLED_ENV, CSHARP_PREWARM_MAX_SYMBOLS,
+    CSHARP_SCIP_CONCURRENCY_DEFAULT, CSHARP_SCIP_CONCURRENCY_ENV, DASHBOARD_PATH, DB_DIR_NAME,
+    DEFAULT_SERVE_PORT, DISABLE_HOST_VALIDATION_ENV, EXPLORE_PATH, FIND_IMPACT_PATH, FIND_PATH,
+    HEALTHZ_PATH, HEALTH_PATH, INDEXING_PATH, LANG_CSHARP, LANG_TYPESCRIPT, MAX_INDEXING_SECS,
+    MAX_INDEXING_SECS_ENV, MCP_ENDPOINT_PATH, PERSIST_DEBOUNCE_SECS, REAPER_INTERVAL_SECS,
+    REMOTES_PATH, REPO_IDLE_TIMEOUT_ENV, REPO_IDLE_TIMEOUT_SECS, SEARCH_PATH, SERVE_API_KEY_ENV,
+    SERVE_PORT_ENV, STATUS_PATH,
 };
 use crate::db_discovery::repos::{config_dir, ReposConfig};
 use crate::index::{
@@ -109,6 +111,19 @@ pub(crate) struct RepoStatusInfo {
 }
 
 impl RepoStateLabel {
+    /// Wire name used by `/status`, `/api/repos` and the TUI poller.
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Warm => "warm",
+            Self::Readonly => "readonly",
+            Self::Closed => "closed",
+            Self::Indexing => "indexing",
+            Self::Error => "error",
+            Self::NoIndex => "no_index",
+        }
+    }
+
     #[allow(dead_code)]
     fn colored(&self) -> colored::ColoredString {
         match self {
@@ -3623,15 +3638,7 @@ async fn status_handler(
     let repo_json: Vec<serde_json::Value> = repos
         .iter()
         .map(|(alias, info)| {
-            let status_str = match info.status {
-                RepoStateLabel::Open => "open",
-                RepoStateLabel::Warm => "warm",
-                RepoStateLabel::Readonly => "readonly",
-                RepoStateLabel::Closed => "closed",
-                RepoStateLabel::Indexing => "indexing",
-                RepoStateLabel::Error => "error",
-                RepoStateLabel::NoIndex => "no_index",
-            };
+            let status_str = info.status.as_str();
             let lock_mode = match info.status {
                 RepoStateLabel::Open | RepoStateLabel::Indexing => "write",
                 RepoStateLabel::Warm | RepoStateLabel::Readonly => "read",
@@ -3732,13 +3739,13 @@ async fn status_handler(
         "uptime_secs": uptime_secs,
         "qos": qos_status_json(),
         "latency": crate::telemetry::reads()
-            .summary_at(std::time::Instant::now(), crate::telemetry::RETENTION),
+            .summary_at(std::time::Instant::now(), crate::telemetry::SUMMARY_WINDOW),
         "index_governor": crate::index::governor::global().status(),
     }))
 }
 
 /// Scheduling classes in effect: `read` is the calling (tool-serving) thread.
-fn qos_status_json() -> serde_json::Value {
+pub(crate) fn qos_status_json() -> serde_json::Value {
     let pool = crate::index::executor::global();
     json!({
         "read": crate::qos::current_thread().map(crate::qos::ThreadQos::as_str),
@@ -5697,6 +5704,24 @@ pub async fn run_serve(
         // without the admin key on localhost, protected by
         // require_auth_for_network on network binds. See REMOTES_PATH doc.
         .route(REMOTES_PATH, axum::routing::get(remotes_handler))
+        // Health dashboard + its JSON API: read-only, same auth class as /status.
+        .route(
+            DASHBOARD_PATH,
+            axum::routing::get(dashboard::dashboard_handler),
+        )
+        .route(
+            API_SUMMARY_PATH,
+            axum::routing::get(dashboard::summary_handler),
+        )
+        .route(
+            API_LATENCY_PATH,
+            axum::routing::get(dashboard::latency_handler),
+        )
+        .route(API_REPOS_PATH, axum::routing::get(dashboard::repos_handler))
+        .route(
+            API_EVENTS_PATH,
+            axum::routing::get(dashboard::events_handler),
+        )
         .route("/repos", axum::routing::post(add_repo_handler))
         .route("/repos/{alias}", axum::routing::delete(remove_repo_handler))
         .route("/reload", axum::routing::post(reload_handler))
@@ -5749,6 +5774,7 @@ pub async fn run_serve(
     info!("✅ codesearch serve ready at http://{}", addr);
     info!("   Health: http://{}{}", addr, HEALTH_PATH);
     info!("   MCP:    http://{}{}", addr, MCP_ENDPOINT_PATH);
+    info!("   Health dashboard: http://{}{}", addr, DASHBOARD_PATH);
 
     // ── Start TUI (if TTY available) ──
     // When a real terminal is attached, launch the fullscreen ratatui TUI.

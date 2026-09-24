@@ -121,8 +121,30 @@ pub struct ExploreRequest {
 /// Unified status/info request — replaces `index_status` and `list_projects`.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct StatusRequest {
-    /// What status to return: `"index"` (default) | `"projects"`.
+    /// What status to return: `"index"` (default) | `"projects"` | `"health"` |
+    /// `"latency"` | `"repos"` | `"events"`.
     pub kind: Option<String>,
+
+    /// `kind="latency"`: window in hours (1-24, default 6).
+    #[serde(default)]
+    pub hours: Option<u64>,
+
+    /// `kind="latency"`: bucket size in minutes (1-240, default 10).
+    #[serde(default)]
+    pub bucket_minutes: Option<u64>,
+
+    /// `kind="repos"`: exact alias, or a substring of the repo path.
+    #[serde(default)]
+    pub query: Option<String>,
+
+    /// `kind="repos"`: only repos with this status (`failing`, `indexing`,
+    /// `queued`, `open`, `warm`, `closed`, `no_index`, ...).
+    #[serde(default)]
+    pub repo_status: Option<String>,
+
+    /// `kind="events"`: number of events, newest first (1-500, default 50).
+    #[serde(default)]
+    pub limit: Option<usize>,
 
     /// Route to a specific project's index status (requires `codesearch serve`).
     #[serde(default)]

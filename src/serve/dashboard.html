@@ -1,0 +1,418 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Codesearch Health</title>
+<link rel="icon" href="data:,">
+<style>
+:root {
+  color-scheme: light;
+  --bg: #f3f5f4; --panel: #ffffff; --ink: #1b242c; --muted: #5b6770; --line: #d3dadc; --grid: #e7ecec;
+  --flow: #2c6aa3; --flow-soft: #e3edf6; --gate: #b86a12; --gate-soft: #f8ecdc;
+  --p50: #7d8a93; --p95: #2c6aa3; --p98: #16867f; --p99: #b86a12; --p100: #8a4a9e;
+  --ok: #2f7d4f; --ok-soft: #e1f1e7; --bad: #b3372f; --bad-soft: #f7e3e1;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --cond: "Avenir Next Condensed", "Arial Narrow", system-ui, sans-serif;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: #12181d; --panel: #1a2229; --ink: #e3e9ec; --muted: #97a4ad; --line: #34414a; --grid: #26313a;
+    --flow: #6ea8dc; --flow-soft: #1d2d3c; --gate: #e0a052; --gate-soft: #332617;
+    --p50: #8d9aa3; --p95: #6ea8dc; --p98: #4fc2b8; --p99: #e0a052; --p100: #c592d6;
+    --ok: #6cc38f; --ok-soft: #173024; --bad: #ea7c73; --bad-soft: #3a1f1d;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #12181d; --panel: #1a2229; --ink: #e3e9ec; --muted: #97a4ad; --line: #34414a; --grid: #26313a;
+  --flow: #6ea8dc; --flow-soft: #1d2d3c; --gate: #e0a052; --gate-soft: #332617;
+  --p50: #8d9aa3; --p95: #6ea8dc; --p98: #4fc2b8; --p99: #e0a052; --p100: #c592d6;
+  --ok: #6cc38f; --ok-soft: #173024; --bad: #ea7c73; --bad-soft: #3a1f1d;
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.5 var(--sans); padding-inline: 16px; padding-block: 24px 48px; }
+.wrap { max-width: 1200px; margin: 0 auto; display: grid; gap: 20px; }
+header { display: flex; flex-wrap: wrap; align-items: center; gap: 14px 20px; }
+h1 { font: 700 28px/1.1 var(--cond); margin: 0; }
+h2 { font: 600 17px/1.2 var(--cond); margin: 0; letter-spacing: .01em; }
+.status { font: 600 13px/1 var(--mono); letter-spacing: .08em; text-transform: uppercase; padding: 8px 12px; border-radius: 4px; background: var(--grid); }
+.status.ok { background: var(--ok-soft); color: var(--ok); }
+.status.degraded { background: var(--gate-soft); color: var(--gate); }
+.status.down { background: var(--bad-soft); color: var(--bad); }
+.updated { color: var(--muted); font: 12px var(--mono); margin-left: auto; }
+.reasons { margin: 0; padding: 12px 16px 12px 32px; background: var(--bad-soft); border-radius: 4px; color: var(--ink); display: grid; gap: 4px; }
+.reasons.degraded { background: var(--gate-soft); }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 16px 18px; display: grid; gap: 12px; align-content: start; min-width: 0; }
+.stats { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
+.stat .label { font: 500 11px var(--mono); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.stat .value { font: 600 26px/1.1 var(--cond); font-variant-numeric: tabular-nums; }
+.stat .note { color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
+.value.good { color: var(--ok); } .value.warn { color: var(--gate); } .value.bad { color: var(--bad); }
+.row { display: grid; gap: 20px; grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); }
+@media (max-width: 900px) { .row { grid-template-columns: 1fr; } }
+.chart-head { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: baseline; }
+.legend { display: flex; flex-wrap: wrap; gap: 14px; color: var(--muted); font-size: 12px; }
+.legend i { display: inline-block; width: 14px; height: 0; border-top: 2px solid; vertical-align: middle; margin-right: 6px; }
+.pchips { display: flex; flex-wrap: wrap; gap: 6px; border: 0; margin: 0; padding: 0; }
+.pchips legend { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+.pchip { position: relative; display: inline-flex; align-items: center; gap: 6px; font: 500 12px/1 var(--mono); padding: 6px 9px; border: 1px solid var(--line); border-radius: 999px; cursor: pointer; color: var(--muted); user-select: none; }
+.pchip input { position: absolute; opacity: 0; pointer-events: none; }
+.pchip .dot { width: 9px; height: 9px; border-radius: 50%; border: 2px solid var(--c); }
+.pchip:has(input:checked) { color: var(--ink); border-color: var(--c); }
+.pchip:has(input:checked) .dot { background: var(--c); }
+.pchip:has(input:focus-visible) { outline: 2px solid var(--flow); outline-offset: 2px; }
+.plist { display: grid; grid-template-columns: repeat(auto-fit, minmax(56px, 1fr)); gap: 8px; }
+.plist div { display: grid; gap: 2px; font-variant-numeric: tabular-nums; }
+.plist .k { font: 500 11px var(--mono); color: var(--muted); }
+.plist .v { font: 600 18px/1.2 var(--cond); }
+.plist .v.good { color: var(--ok); } .plist .v.warn { color: var(--gate); } .plist .v.bad { color: var(--bad); }
+.chart { overflow-x: auto; }
+.chart svg { display: block; width: 100%; min-width: 560px; height: auto; }
+.chart text { font: 11px var(--mono); fill: var(--muted); }
+select, input { font: 13px var(--sans); color: var(--ink); background: var(--panel); border: 1px solid var(--line); border-radius: 4px; padding: 6px 8px; }
+select:focus-visible, input:focus-visible { outline: 2px solid var(--flow); outline-offset: 1px; }
+.controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.table-wrap { overflow: auto; max-height: 460px; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { text-align: left; padding: 7px 10px 7px 0; border-bottom: 1px solid var(--grid); vertical-align: top; }
+th { position: sticky; top: 0; background: var(--panel); font: 500 11px var(--mono); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+td.num, th.num { font-family: var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap; text-align: right; }
+td.path, div.path { color: var(--muted); font: 12px var(--mono); word-break: break-all; }
+.pill { font: 500 11px/1 var(--mono); padding: 4px 6px; border-radius: 3px; white-space: nowrap; background: var(--grid); color: var(--muted); }
+.pill.failing, .pill.error { background: var(--bad-soft); color: var(--bad); }
+.pill.indexing { background: var(--flow-soft); color: var(--flow); }
+.pill.open, .pill.warm { background: var(--ok-soft); color: var(--ok); }
+.pill.queued { background: var(--gate-soft); color: var(--gate); }
+.events { list-style: none; margin: 0; padding: 0; display: grid; max-height: 460px; overflow: auto; }
+.events li { display: grid; grid-template-columns: 64px 1fr; gap: 10px; padding: 7px 0; border-bottom: 1px solid var(--grid); font-size: 13px; }
+.events time { font: 12px var(--mono); color: var(--muted); }
+.events .detail { color: var(--muted); font: 12px var(--mono); word-break: break-word; }
+.events li.warn .msg { color: var(--gate); } .events li.error .msg { color: var(--bad); }
+.empty { color: var(--muted); }
+footer { color: var(--muted); font-size: 12px; }
+code { font: 12px var(--mono); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Codesearch health</h1>
+    <span id="status" class="status">loading</span>
+    <span id="updated" class="updated"></span>
+  </header>
+  <ul id="reasons" class="reasons" hidden></ul>
+
+  <section class="stats">
+    <div class="panel stat"><span class="label">Tool-call latency, last hour</span><div id="plist" class="plist"></div><span id="plistnote" class="note"></span></div>
+    <div class="panel stat"><span class="label">Last 5 minutes</span><span id="recent" class="value">-</span><span id="recentnote" class="note"></span></div>
+    <div class="panel stat"><span class="label">Indexing governor</span><span id="gov" class="value">-</span><span id="govnote" class="note"></span></div>
+    <div class="panel stat"><span class="label">Repos</span><span id="repocount" class="value">-</span><span id="reponote" class="note"></span></div>
+  </section>
+
+  <section class="panel">
+    <div class="chart-head">
+      <h2>Tool-call latency</h2>
+      <fieldset id="pchips" class="pchips"><legend>Percentiles to show</legend></fieldset>
+      <div class="legend">
+        <span><i style="border-color:var(--bad);border-top-style:dashed"></i><span id="slolegend">SLO</span></span>
+        <span><i style="border-color:var(--gate);border-top-style:dotted"></i><span id="targetlegend">indexing yields above</span></span>
+        <span><i style="border-color:var(--bad);border-top-width:6px;width:6px"></i>failed call</span>
+      </div>
+      <div class="controls" style="margin-left:auto">
+        <label for="hours" class="empty">Window</label>
+        <select id="hours"><option value="1">1 hour</option><option value="6" selected>6 hours</option><option value="24">24 hours</option></select>
+      </div>
+    </div>
+    <div id="chart" class="chart"></div>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Tool, last hour</th><th class="num">Calls</th><th class="num">Failed</th><th class="num">p50</th><th class="num">p95</th><th class="num">p99</th><th class="num">p100</th></tr></thead>
+      <tbody id="tools"></tbody>
+    </table></div>
+  </section>
+
+  <div class="row">
+    <section class="panel">
+      <div class="chart-head">
+        <h2>Repositories</h2>
+        <div class="controls" style="margin-left:auto">
+          <label for="filter" class="empty">Filter</label>
+          <input id="filter" type="search" placeholder="alias or path">
+          <select id="statusFilter" aria-label="Status"><option value="">All statuses</option><option>failing</option><option>indexing</option><option value="queued">queued</option><option>open</option><option>warm</option><option>readonly</option><option>closed</option><option>error</option><option>no_index</option></select>
+        </div>
+      </div>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Repo</th><th>Status</th><th class="num">Indexed</th><th class="num">Took</th><th class="num">Pending</th></tr></thead>
+        <tbody id="repos"></tbody>
+      </table></div>
+    </section>
+    <section class="panel">
+      <h2>Index events</h2>
+      <ul id="events" class="events"></ul>
+    </section>
+  </div>
+
+  <footer>Served by <code>codesearch serve</code> from in-process telemetry; history resets when serve restarts. Refreshes every 15 seconds. JSON API: <code>/api/summary</code>, <code>/api/latency</code>, <code>/api/repos</code>, <code>/api/events</code>.</footer>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const PERCENTILES = ['p50', 'p95', 'p98', 'p99', 'p100'];
+const PREF_KEY = 'codesearch-health.percentiles';
+let slo = 5000;
+let readTarget = 1000;
+let lastSummary = null;
+let lastLatency = null;
+let repoRows = [];
+
+function loadSelected() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(PREF_KEY));
+    if (Array.isArray(saved)) return new Set(saved.filter((p) => PERCENTILES.includes(p)));
+  } catch {}
+  return new Set(['p50', 'p95', 'p99']);
+}
+let selected = loadSelected();
+function saveSelected() {
+  try { localStorage.setItem(PREF_KEY, JSON.stringify([...selected])); } catch {}
+}
+function sloClass(v) {
+  return v == null ? '' : v > slo ? 'bad' : v > readTarget ? 'warn' : 'good';
+}
+function ms(value) {
+  if (value == null) return '-';
+  return value >= 1000 ? `${(value / 1000).toFixed(value >= 10000 ? 0 : 1)}s` : `${Math.round(value)}ms`;
+}
+function ago(tsMs) {
+  if (!tsMs) return 'never';
+  const s = Math.max(0, Math.round((Date.now() - tsMs) / 1000));
+  if (s < 90) return `${s}s ago`;
+  if (s < 5400) return `${Math.round(s / 60)}m ago`;
+  if (s < 172800) return `${Math.round(s / 3600)}h ago`;
+  return `${Math.round(s / 86400)}d ago`;
+}
+function clock(tsMs) {
+  const d = new Date(tsMs);
+  return Number.isNaN(d.getTime()) ? '' : d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+function duration(secs) {
+  if (secs == null) return '';
+  if (secs < 3600) return `${Math.round(secs / 60)}m`;
+  if (secs < 172800) return `${Math.round(secs / 3600)}h`;
+  return `${Math.round(secs / 86400)}d`;
+}
+function basename(p) {
+  return String(p).split(/[\\/]/).filter(Boolean).pop() || p;
+}
+function el(tag, attrs = {}, ...children) {
+  const node = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) k === 'class' ? (node.className = v) : node.setAttribute(k, v);
+  for (const c of children) node.append(c);
+  return node;
+}
+async function getJson(route) {
+  const res = await fetch(route, { cache: 'no-store' });
+  if (!res.ok) throw new Error(`${route} returned ${res.status}`);
+  return res.json();
+}
+
+function renderChips() {
+  const chips = PERCENTILES.map((p) => {
+    const input = el('input', { type: 'checkbox', id: `chip-${p}`, value: p });
+    input.checked = selected.has(p);
+    input.addEventListener('change', () => {
+      input.checked ? selected.add(p) : selected.delete(p);
+      saveSelected();
+      if (lastSummary) renderLatencyTile(lastSummary);
+      if (lastLatency) renderChart(lastLatency);
+    });
+    return el('label', { class: 'pchip', for: `chip-${p}`, style: `--c: var(--${p})` }, input, el('span', { class: 'dot' }), p);
+  });
+  $('pchips').replaceChildren($('pchips').querySelector('legend'), ...chips);
+}
+
+function renderLatencyTile(s) {
+  const lat = s.latency_1h.overall;
+  const shown = PERCENTILES.filter((p) => selected.has(p));
+  $('plist').replaceChildren(...(shown.length ? shown.map((p) =>
+    el('div', {}, el('span', { class: 'k' }, p), el('span', { class: `v ${sloClass(lat[p])}` }, ms(lat[p]))))
+    : [el('span', { class: 'note' }, 'No percentiles selected')]));
+  $('plistnote').textContent = `${lat.count} calls, ${lat.failures} failed. SLO: p95 under ${ms(s.slo_ms)}`;
+}
+
+function renderGovernor(g) {
+  const running = g.index_governor.running;
+  const waiting = g.index_governor.waiting;
+  const paused = running.find((j) => j.paused);
+  const state = paused ? 'paused' : running.length ? 'indexing' : waiting.length ? 'waiting' : 'idle';
+  $('gov').textContent = state;
+  $('gov').className = `value ${paused ? 'warn' : ''}`;
+  const current = running[0];
+  const parts = [];
+  if (current) parts.push(`${basename(current.label)} (${current.priority}, ${current.secs}s)`);
+  if (paused) parts.push(paused.paused);
+  if (waiting.length) parts.push(`${waiting.length} waiting`);
+  const inputs = g.index_governor.inputs;
+  if (inputs.memory_pressure && inputs.memory_pressure !== 'normal' && !paused?.paused.includes('memory')) parts.push(`memory ${inputs.memory_pressure}`);
+  if (inputs.other_cpu_percent != null) parts.push(`other CPU ${Math.round(inputs.other_cpu_percent)}%`);
+  parts.push(`QoS ${g.qos.index} x${g.qos.index_threads}`);
+  $('govnote').textContent = parts.join('. ');
+}
+
+function renderTools(s) {
+  const tools = Object.entries(s.latency_1h.by_tool).sort((a, b) => b[1].count - a[1].count);
+  $('tools').replaceChildren(...(tools.length ? tools.map(([name, t]) => el('tr', {},
+    el('td', {}, el('code', {}, name)),
+    el('td', { class: 'num' }, String(t.count)),
+    el('td', { class: 'num' }, String(t.failures)),
+    ...['p50', 'p95', 'p99', 'p100'].map((p) => el('td', { class: `num` }, el('span', { class: `value ${sloClass(t[p])}` }, ms(t[p]))))))
+    : [el('tr', {}, el('td', { class: 'empty', colspan: '7' }, 'No tool calls in the last hour'))]));
+}
+
+function renderSummary(s) {
+  lastSummary = s;
+  slo = s.slo_ms;
+  readTarget = s.read_target_ms;
+  $('slolegend').textContent = `${ms(slo)} SLO`;
+  $('targetlegend').textContent = `${ms(readTarget)} read target (indexing yields above)`;
+  $('status').textContent = s.status;
+  $('status').className = `status ${s.status}`;
+  $('updated').textContent = `v${s.version}, up ${duration(s.uptime_secs)}, updated ${clock(s.generated_at_ms)}`;
+  const reasons = $('reasons');
+  reasons.replaceChildren(...s.reasons.map((r) => el('li', {}, r)));
+  reasons.className = `reasons ${s.status}`;
+  reasons.hidden = s.reasons.length === 0;
+
+  renderLatencyTile(s);
+  const recent = s.latency_5m.overall;
+  $('recent').textContent = recent.count ? ms(recent.p95) : '-';
+  $('recent').className = `value ${sloClass(recent.p95)}`;
+  $('recentnote').textContent = recent.count ? `p95 of ${recent.count} calls, slowest ${ms(recent.p100)}` : 'No tool calls';
+
+  renderGovernor(s);
+  renderTools(s);
+  $('repocount').textContent = s.repos.total;
+  $('repocount').className = `value ${s.repos.failing ? 'bad' : ''}`;
+  $('reponote').textContent = `${s.repos.indexing} indexing, ${s.repos.failing} failing, ${s.repos.queued} queued`;
+}
+
+function renderChart(latency) {
+  lastLatency = latency;
+  const { buckets } = latency;
+  const shown = PERCENTILES.filter((p) => selected.has(p));
+  const W = 900, H = 240, L = 48, R = 40, T = 12, B = 28;
+  const values = buckets.flatMap((b) => shown.map((p) => b[p])).filter((v) => v != null);
+  const top = Math.max(slo * 1.2, ...values.map((v) => Math.min(v, slo * 3)));
+  const x = (i) => L + ((W - L - R) * (i + 0.5)) / buckets.length;
+  const y = (v) => T + (H - T - B) * (1 - Math.min(v, top) / top);
+  const ns = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(ns, 'svg');
+  svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+  svg.setAttribute('role', 'img');
+  svg.setAttribute('aria-label', `Tool-call latency ${shown.join(', ') || 'no percentiles'} over time with ${ms(slo)} SLO line`);
+  const add = (tag, attrs, text) => {
+    const n = document.createElementNS(ns, tag);
+    for (const [k, v] of Object.entries(attrs)) n.setAttribute(k, v);
+    if (text != null) n.textContent = text;
+    svg.append(n);
+    return n;
+  };
+  const step = top > 12000 ? 5000 : top > 6000 ? 2000 : 1000;
+  for (let v = 0; v <= top; v += step) {
+    add('line', { x1: L, x2: W - R, y1: y(v), y2: y(v), stroke: 'var(--grid)', 'stroke-width': 1 });
+    add('text', { x: L - 6, y: y(v) + 4, 'text-anchor': 'end' }, ms(v));
+  }
+  add('line', { x1: L, x2: W - R, y1: y(readTarget), y2: y(readTarget), stroke: 'var(--gate)', 'stroke-width': 1.2, 'stroke-dasharray': '2 3' });
+  add('line', { x1: L, x2: W - R, y1: y(slo), y2: y(slo), stroke: 'var(--bad)', 'stroke-width': 1.2, 'stroke-dasharray': '5 4' });
+  const labelEvery = Math.max(1, Math.ceil(buckets.length / 8));
+  buckets.forEach((b, i) => {
+    if (i % labelEvery === 0) add('text', { x: x(i), y: H - 8, 'text-anchor': 'middle' }, clock(b.start_ms));
+  });
+  const line = (key, color, width) => {
+    let d = '';
+    let pen = false;
+    buckets.forEach((b, i) => {
+      if (b[key] == null) { pen = false; return; }
+      d += `${pen ? 'L' : 'M'}${x(i).toFixed(1)},${y(b[key]).toFixed(1)}`;
+      pen = true;
+    });
+    if (d) add('path', { d, fill: 'none', stroke: color, 'stroke-width': width, 'stroke-linejoin': 'round' });
+    buckets.forEach((b, i) => {
+      const lonely = b[key] != null && buckets[i - 1]?.[key] == null && buckets[i + 1]?.[key] == null;
+      if (lonely) add('circle', { cx: x(i).toFixed(1), cy: y(b[key]).toFixed(1), r: 3, fill: color });
+    });
+  };
+  shown.forEach((p) => line(p, `var(--${p})`, p === 'p50' ? 1.4 : 2));
+  buckets.forEach((b, i) => {
+    if (b.failures) {
+      add('rect', { x: x(i) - 3, y: T, width: 6, height: 6, fill: 'var(--bad)' }).append(
+        Object.assign(document.createElementNS(ns, 'title'), { textContent: `${b.failures} failed call(s) at ${clock(b.start_ms)}` }),
+      );
+    }
+  });
+  if (!values.length) add('text', { x: W / 2, y: H / 2, 'text-anchor': 'middle' }, shown.length ? 'No tool calls in this window' : 'Select a percentile to plot');
+  $('chart').replaceChildren(svg);
+}
+
+function renderRepos() {
+  const q = $('filter').value.trim().toLowerCase();
+  const status = $('statusFilter').value;
+  const rows = repoRows.filter((r) =>
+    (!q || r.alias.toLowerCase().includes(q) || r.path.toLowerCase().includes(q)) &&
+    (!status || (status === 'queued' ? r.queued : r.status === status)));
+  $('repos').replaceChildren(...(rows.length ? rows.map((r) => {
+    const statusCell = el('td', {}, el('span', { class: `pill ${r.status}` }, r.status));
+    if (r.queued) statusCell.append(' ', el('span', { class: 'pill queued' }, 'queued'));
+    if (r.error) statusCell.append(el('div', { class: 'path' }, `${r.failures}x: ${r.error}`));
+    return el('tr', {},
+      el('td', {}, el('div', {}, r.alias), el('div', { class: 'path' }, r.path)),
+      statusCell,
+      el('td', { class: 'num' }, ago(r.indexed_at_ms)),
+      el('td', { class: 'num' }, ms(r.duration_ms)),
+      el('td', { class: 'num' }, String(r.changes)));
+  }) : [el('tr', {}, el('td', { class: 'empty', colspan: '5' }, 'No repos match'))]));
+}
+
+function renderEvents(events) {
+  const detail = (e) => [e.repo && basename(e.repo), e.duration_ms != null && `took ${ms(e.duration_ms)}`].filter(Boolean).join(', ');
+  $('events').replaceChildren(...(events.length ? events.map((e) =>
+    el('li', { class: e.level }, el('time', {}, clock(e.ts_ms)), el('div', {}, el('div', { class: 'msg' }, e.msg), el('div', { class: 'detail' }, detail(e)))))
+    : [el('li', { class: 'empty' }, 'No index events since serve started')]));
+}
+
+async function refresh() {
+  try {
+    const hours = $('hours').value;
+    const bucketMinutes = { 1: 2, 6: 10, 24: 30 }[hours];
+    const [summary, latency, repos, events] = await Promise.all([
+      getJson('/api/summary'),
+      getJson(`/api/latency?hours=${hours}&bucket_minutes=${bucketMinutes}`),
+      getJson('/api/repos'),
+      getJson('/api/events?limit=60'),
+    ]);
+    renderSummary(summary);
+    renderChart(latency);
+    repoRows = repos;
+    renderRepos();
+    renderEvents(events);
+  } catch (error) {
+    $('status').textContent = 'down';
+    $('status').className = 'status down';
+    $('reasons').replaceChildren(el('li', {}, `Dashboard could not load data: ${error.message}. Check that codesearch serve is running.`));
+    $('reasons').className = 'reasons';
+    $('reasons').hidden = false;
+  }
+}
+
+renderChips();
+$('hours').addEventListener('change', refresh);
+$('filter').addEventListener('input', renderRepos);
+$('statusFilter').addEventListener('change', renderRepos);
+refresh();
+setInterval(refresh, 15000);
+</script>
+</body>
+</html>

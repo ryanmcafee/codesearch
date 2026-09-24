@@ -19,6 +19,7 @@ pub mod rerank;
 pub mod search;
 pub mod serve;
 pub mod symbols;
+pub mod telemetry;
 #[cfg(test)]
 pub mod testing;
 pub mod utils;

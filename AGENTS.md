@@ -301,3 +301,17 @@ throttled, background QoS. Ports the dotfiles codesearch governor into the produ
 - `cargo clippy --all-targets -- -D warnings`, `cargo test --lib --bins` each phase.
 - Load test: second serve on a spare port with its own repos.json, force-reindex a
   large repo while a probe loop searches; target p95 <= 1s, report p50..p100.
+
+### Progress
+- [x] Phase 1 -- lock-free reads, atomic publish, `replace_chunks`, batched deletes (782e7be)
+- [x] Phase 2 -- `qos` + `index::executor`, single-thread ONNX per pool thread, shared embedding cache, tokio at user-initiated (123c9ee)
+- [ ] Phase 3/4 -- `index::governor` (admission, priorities, yield points, per-repo exclusivity), `telemetry` (tool-call p50..p100), `/status` + `status(kind="health")`, warmup releases `open_lock` before refresh
+- [ ] Phase 5 -- watcher ignore parity, tantivy merge policy, git hook queue semantics
+
+### Measurements (M-series, 10 cores: 8P + 2E)
+Scenario 1: search repo A while repo B (docs-v2, 2234 files) indexes.
+
+| build | p50 | p95 | p99 | p100 | index time |
+|---|---|---|---|---|---|
+| v1.4.4 | 11ms | 31ms | 49ms | 57ms | 283s |
+| phase 2, background x2 | 6ms | 10ms | 12ms | 53ms | 1805s |

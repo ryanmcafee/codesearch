@@ -23,6 +23,7 @@ use crate::constants::{
 use crate::embed::{EmbeddedChunk, ModelType};
 use crate::fts::FtsStore;
 use crate::index::executor::spawn_index_blocking;
+use crate::index::governor::{self, IndexPriority};
 use crate::symbols::{RebuildScope, SymbolIndexer, SymbolIndexerRegistry};
 use crate::vectordb::VectorStore;
 use crate::watch::{FileEvent, FileWatcher, GitHeadWatcher};
@@ -599,6 +600,26 @@ impl IndexManager {
         stores: &SharedStores,
         cancel_token: &CancellationToken,
     ) -> Result<()> {
+        governor::global()
+            .run_exclusive(
+                &codebase_path.display().to_string(),
+                Self::perform_incremental_refresh_governed(
+                    codebase_path,
+                    db_path,
+                    stores,
+                    cancel_token,
+                ),
+            )
+            .await
+    }
+
+    /// Body of [`Self::perform_incremental_refresh_with_stores`]; runs inside a governor slot.
+    async fn perform_incremental_refresh_governed(
+        codebase_path: &Path,
+        db_path: &Path,
+        stores: &SharedStores,
+        cancel_token: &CancellationToken,
+    ) -> Result<()> {
         use crate::cache::FileMetaStore;
         use crate::chunker::SemanticChunker;
         use crate::file::FileWalker;
@@ -757,6 +778,7 @@ impl IndexManager {
             for (batch_idx, file_batch) in changed_files.chunks(batch_size).enumerate() {
                 // Abort between batches if the repo was removed mid-index.
                 Self::ensure_indexing_active(cancel_token)?;
+                governor::global().yield_to_reads().await;
 
                 // Read + chunk + embed is synchronous, CPU/I/O-heavy work
                 // (file reads, tree-sitter parsing, fastembed/ONNX inference that
@@ -1826,6 +1848,29 @@ impl IndexManager {
         files_to_remove: Vec<PathBuf>,
         cancel_token: &CancellationToken,
     ) -> Result<()> {
+        let job = Self::process_batch_governed(
+            codebase_path,
+            db_path,
+            stores,
+            files_to_index,
+            files_to_remove,
+            cancel_token,
+        );
+        governor::with_priority(
+            IndexPriority::Watcher,
+            governor::global().run_exclusive(&codebase_path.display().to_string(), job),
+        )
+        .await
+    }
+
+    async fn process_batch_governed(
+        codebase_path: &Path,
+        db_path: &Path,
+        stores: &SharedStores,
+        files_to_index: Vec<PathBuf>,
+        files_to_remove: Vec<PathBuf>,
+        cancel_token: &CancellationToken,
+    ) -> Result<()> {
         use crate::output::set_quiet;
 
         let start = std::time::Instant::now();
@@ -1924,6 +1969,7 @@ impl IndexManager {
         // removal phase above.
         Self::ensure_indexing_active(cancel_token)?;
         for file_path in &files_to_index {
+            governor::global().yield_to_reads().await;
             debug!("📄 Indexing: {}", file_path.display());
             if let Err(e) = Self::index_single_file(codebase_path, file_path, stores).await {
                 warn!("⚠️  Failed to index {}: {}", file_path.display(), e);
@@ -1973,6 +2019,20 @@ impl IndexManager {
     /// 5. Rebuilds the vector index
     /// 6. Re-indexes changed/new files
     async fn refresh_index_with_stores(
+        codebase_path: &Path,
+        db_path: &Path,
+        stores: &SharedStores,
+        cancel_token: &CancellationToken,
+    ) -> Result<()> {
+        let job = Self::refresh_index_governed(codebase_path, db_path, stores, cancel_token);
+        governor::with_priority(
+            IndexPriority::Watcher,
+            governor::global().run_exclusive(&codebase_path.display().to_string(), job),
+        )
+        .await
+    }
+
+    async fn refresh_index_governed(
         codebase_path: &Path,
         db_path: &Path,
         stores: &SharedStores,
@@ -2111,6 +2171,7 @@ impl IndexManager {
             Self::ensure_indexing_active(cancel_token)?;
             let reindex_count = files_to_reindex.len();
             for file_path in &files_to_reindex {
+                governor::global().yield_to_reads().await;
                 if let Err(e) = Self::index_single_file(codebase_path, file_path, stores).await {
                     warn!("⚠️  Failed to re-index {}: {}", file_path.display(), e);
                 }

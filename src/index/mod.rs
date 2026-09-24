@@ -17,7 +17,9 @@ use crate::vectordb::{merge_metadata_atomic, VectorStore};
 
 // Index manager module
 pub mod executor;
+pub mod governor;
 mod manager;
+mod system_signals;
 pub use manager::{
     is_database_locked, CSharpRebuildNotifier, IndexManager, IndexingStatusCallback, SharedStores,
     SymbolRebuildSignal,

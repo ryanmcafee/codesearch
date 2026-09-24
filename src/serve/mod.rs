@@ -2346,7 +2346,7 @@ impl ServeState {
         // twice, or the loser trips the LMDB double-open guard and the repo
         // wedges as an incurable Conflicted (todo #131).
         let open_lock = self.open_lock(alias);
-        let _open_guard = open_lock.lock().await;
+        let open_guard = open_lock.lock().await;
         if let Some(entry) = self.repos.get(alias) {
             match entry.value() {
                 RepoState::Write { .. } | RepoState::Warm { .. } | RepoState::Readonly { .. } => {
@@ -2450,6 +2450,20 @@ impl ServeState {
 
         let stores_arc = stores;
 
+        // Publish as Warm and release the open lock BEFORE the refresh: queries
+        // read the committed snapshot while the (governed, possibly queued)
+        // refresh runs, instead of waiting on `open_lock` for its duration.
+        // Start the idle timer here too: warmed-but-never-queried repos must
+        // appear in `last_access` or `evict_idle_repos` never releases them.
+        self.repos.insert(
+            alias.to_string(),
+            RepoState::Warm {
+                stores: Arc::clone(&stores_arc),
+            },
+        );
+        self.touch_access(alias);
+        drop(open_guard);
+
         // Warmup runs at startup (pre-warm), never in response to a user action,
         // so it is given a fresh token that is never cancelled — the refresh runs
         // to completion. A real user-initiated cancel routes through the
@@ -2465,15 +2479,6 @@ impl ServeState {
             tracing::warn!("Warmup '{}': incremental refresh failed: {}", alias, e);
         }
 
-        // Store as Warm — FSW will be started lazily on first query.
-        self.repos
-            .insert(alias.to_string(), RepoState::Warm { stores: stores_arc });
-
-        // Start the idle timer at warmup. A real query will reset it via
-        // touch_access; without this, repos that are warmed but never queried
-        // would never appear in `last_access` and therefore never be evicted
-        // by `evict_idle_repos`, holding LMDB envs and embedder state forever.
-        self.touch_access(alias);
         Ok(())
     }
 
@@ -3726,6 +3731,9 @@ async fn status_handler(
         "ts_helper": ts_helper,
         "uptime_secs": uptime_secs,
         "qos": qos_status_json(),
+        "latency": crate::telemetry::reads()
+            .summary_at(std::time::Instant::now(), crate::telemetry::RETENTION),
+        "index_governor": crate::index::governor::global().status(),
     }))
 }
 
@@ -4291,12 +4299,15 @@ async fn reindex_handler(
             );
 
             // 2. Clear data and reindex
-            match IndexManager::force_reindex_with_stores(
-                &project_path,
-                &db_path,
-                &stores,
-                None,
-                &reindex_token_task,
+            match crate::index::governor::with_priority(
+                crate::index::governor::IndexPriority::Explicit,
+                IndexManager::force_reindex_with_stores(
+                    &project_path,
+                    &db_path,
+                    &stores,
+                    None,
+                    &reindex_token_task,
+                ),
             )
             .await
             {
@@ -4379,11 +4390,14 @@ async fn reindex_handler(
                 "🔄 Incremental reindex triggered for '{}' via HTTP API",
                 alias_bg
             );
-            match IndexManager::perform_incremental_refresh_with_stores(
-                &project_path,
-                &db_path,
-                &stores,
-                &reindex_token_task,
+            match crate::index::governor::with_priority(
+                crate::index::governor::IndexPriority::Explicit,
+                IndexManager::perform_incremental_refresh_with_stores(
+                    &project_path,
+                    &db_path,
+                    &stores,
+                    &reindex_token_task,
+                ),
             )
             .await
             {
@@ -4697,12 +4711,15 @@ async fn add_repo_handler(
             project_path.display()
         );
 
-        match IndexManager::force_reindex_with_stores(
-            &project_path,
-            &db_path,
-            &stores,
-            model_override,
-            &token_for_task,
+        match crate::index::governor::with_priority(
+            crate::index::governor::IndexPriority::Explicit,
+            IndexManager::force_reindex_with_stores(
+                &project_path,
+                &db_path,
+                &stores,
+                model_override,
+                &token_for_task,
+            ),
         )
         .await
         {

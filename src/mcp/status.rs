@@ -14,7 +14,7 @@ use rmcp::{
 impl CodesearchService {
     /// Unified status tool — dispatches based on `kind`.
     #[tool(
-        description = "Unified status/info tool. Set `kind` to choose the action:\n\n- `index` (default): get the status of the local search index (model info, chunk count, readiness)\n- `projects`: list all registered projects/repositories, groups, and their index status"
+        description = "Unified status/info tool. Set `kind` to choose the action:\n\n- `index` (default): get the status of the local search index (model info, chunk count, readiness)\n- `projects`: list all registered projects/repositories, groups, and their index status\n- `health`: tool-call latency (p50..p100, last 5 min and last hour) against the read target, plus the indexing governor's running/waiting jobs and why indexing is paused"
     )]
     pub(crate) async fn status(
         &self,
@@ -25,8 +25,11 @@ impl CodesearchService {
         match kind.as_str() {
             "index" => self.index_status_impl(request.project, request.group).await,
             "projects" => self.list_projects().await,
+            "health" => Ok(CallToolResult::success(vec![ContentBlock::text(
+                health_report().to_string(),
+            )])),
             _ => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-                "Unknown status kind '{}'. Use `index` or `projects`.",
+                "Unknown status kind '{}'. Use `index`, `projects` or `health`.",
                 kind
             ))])),
         }
@@ -454,4 +457,22 @@ impl CodesearchService {
         let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
         Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
     }
+}
+
+/// Read-path latency and indexing-governor state for `status(kind="health")`.
+pub(crate) fn health_report() -> serde_json::Value {
+    use std::time::{Duration, Instant};
+    let reads = crate::telemetry::reads();
+    let now = Instant::now();
+    let pool = crate::index::executor::global();
+    serde_json::json!({
+        "read_target_ms": crate::index::governor::configured().1.read_target_ms,
+        "latency_5m": reads.summary_at(now, Duration::from_secs(300)),
+        "latency_1h": reads.summary_at(now, crate::telemetry::RETENTION),
+        "index_governor": crate::index::governor::global().status(),
+        "qos": {
+            "index": pool.qos().as_str(),
+            "index_threads": pool.threads(),
+        },
+    })
 }

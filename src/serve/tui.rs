@@ -1162,12 +1162,15 @@ pub(crate) fn spawn_force_reindex(alias: String, state: &Arc<ServeState>) -> Rei
             alias_bg
         );
 
-        match IndexManager::force_reindex_with_stores(
-            &project_path,
-            &db_path,
-            &stores,
-            None,
-            &reindex_token_task,
+        match crate::index::governor::with_priority(
+            crate::index::governor::IndexPriority::Explicit,
+            IndexManager::force_reindex_with_stores(
+                &project_path,
+                &db_path,
+                &stores,
+                None,
+                &reindex_token_task,
+            ),
         )
         .await
         {

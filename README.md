@@ -342,7 +342,7 @@ On a running `codesearch serve` the same lookup is available over plain REST —
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `kind` | `"index"` \| `"projects"` | What to query |
+| `kind` | `"index"` \| `"projects"` \| `"health"` | What to query (`health`: tool-call latency and indexing governor state) |
 | `project` / `group` | string | Multi-repo routing |
 
 ## Serve Mode (Multi-Repo)
@@ -580,7 +580,24 @@ In the `codesearch serve` TUI, mounts appear in **italic/cyan**, distinguishing 
 | `CODESEARCH_BATCH_SIZE` | Embedding batch size |
 | `CODESEARCH_SCIP_CSHARP` | Override path to `scip-csharp` helper |
 | `CODESEARCH_EXTENSION_MAP` | Path to the extension→language map (default: `~/.codesearch/extensions.json`) — see [Extension map](#extension-map) |
+| `CODESEARCH_GLOBAL_IGNORE` | Path to the global ignore file (default: `~/.codesearch/.codesearchignore`) |
+| `CODESEARCH_READ_LATENCY_TARGET_MS` | Tool-call latency target; a `search`/`find`/`explore`/`get_chunk` slower than this pauses indexing for 30s (default: 1000) — see [Read-path QoS](#read-path-qos-and-indexing-throttling) |
+| `CODESEARCH_INDEX_MAX_JOBS` | Index jobs that may run at once across all repos (default: 1) |
+| `CODESEARCH_INDEX_THREADS` | Threads in the indexing pool (default: cores / 4, 1–4) |
+| `CODESEARCH_INDEX_QOS` | Indexing pool priority: `background` (default; Apple Silicon efficiency cores) or `utility` |
+| `CODESEARCH_INDEX_MAX_OTHER_CPU` | Background indexing waits while other processes use more than this % CPU (default: 70) |
+| `CODESEARCH_INDEX_PAUSE_ON_BATTERY` | `true` pauses background indexing on battery (default: false) |
 | `RUST_LOG` | Log level (e.g. `codesearch=debug`) |
+
+### Read-path QoS and indexing throttling
+
+Tool calls must stay fast while repos index. Serve separates the two paths:
+
+- **Reads never wait on writes.** Searches read the last committed LMDB/tantivy snapshot. Each index update (delete + insert + incremental HNSW build) commits in one write transaction, so a search sees either the old or the new version of a file, never a gap or "index not built".
+- **Indexing runs on its own low-priority pool.** Chunking, embedding and HNSW builds run on `CODESEARCH_INDEX_THREADS` threads at `CODESEARCH_INDEX_QOS` (macOS QoS classes, Linux `nice`); tool calls run at user-initiated priority.
+- **A governor admits index jobs.** At most `CODESEARCH_INDEX_MAX_JOBS` run at once (never two for the same repo); explicit requests (`POST /repos`, reindex, TUI) go before watcher batches, which go before background refreshes. Between batches a job pauses while a recent tool call exceeded the read target, memory pressure is high, or (background work only) other processes are busy. Every pause is capped (30s explicit, 2 min watcher, 10 min background) so indexing always finishes.
+
+`GET /status` reports `latency` (p50/p95/p98/p99/p100 per tool, last hour), `qos`, and `index_governor` (running/waiting jobs and why a job is paused). The MCP `status` tool exposes the same with `kind="health"`.
 
 ### `.codesearchignore`
 

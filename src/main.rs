@@ -18,6 +18,7 @@ mod rerank;
 mod search;
 mod serve;
 mod symbols;
+mod telemetry;
 #[cfg(test)]
 mod testing;
 mod vectordb;

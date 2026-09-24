@@ -2001,8 +2001,7 @@ pub(crate) async fn rest_search_handler(
     AxumJson(req): AxumJson<SearchRequest>,
 ) -> Result<RestResponse, RestError> {
     let service = make_service(&state)?;
-    let result = service
-        .search(Parameters(req))
+    let result = crate::telemetry::timed("search", service.search(Parameters(req)))
         .await
         .map_err(mcp_err_to_http)?;
     Ok(AxumJson(call_tool_result_to_json(result)))
@@ -2013,8 +2012,7 @@ pub(crate) async fn rest_find_handler(
     AxumJson(req): AxumJson<FindRequest>,
 ) -> Result<RestResponse, RestError> {
     let service = make_service(&state)?;
-    let result = service
-        .find(Parameters(req))
+    let result = crate::telemetry::timed("find", service.find(Parameters(req)))
         .await
         .map_err(mcp_err_to_http)?;
     Ok(AxumJson(call_tool_result_to_json(result)))
@@ -2025,8 +2023,7 @@ pub(crate) async fn rest_explore_handler(
     AxumJson(req): AxumJson<ExploreRequest>,
 ) -> Result<RestResponse, RestError> {
     let service = make_service(&state)?;
-    let result = service
-        .explore(Parameters(req))
+    let result = crate::telemetry::timed("explore", service.explore(Parameters(req)))
         .await
         .map_err(mcp_err_to_http)?;
     Ok(AxumJson(call_tool_result_to_json(result)))
@@ -2045,8 +2042,7 @@ pub(crate) async fn rest_get_chunk_handler(
         group: params.get("group").cloned(),
     };
     let service = make_service(&state)?;
-    let result = service
-        .get_chunk(Parameters(req))
+    let result = crate::telemetry::timed("get_chunk", service.get_chunk(Parameters(req)))
         .await
         .map_err(mcp_err_to_http)?;
     Ok(AxumJson(call_tool_result_to_json(result)))
@@ -2076,6 +2072,17 @@ impl CodesearchService {
 
 #[tool_handler(router = Self::merged_tool_router())]
 impl ServerHandler for CodesearchService {
+    /// Same dispatch `#[tool_handler]` generates, timed for read-path telemetry.
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResponse, McpError> {
+        let tool = request.name.to_string();
+        let call = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        crate::telemetry::timed(&tool, Self::merged_tool_router().call(call)).await
+    }
+
     fn get_info(&self) -> ServerConfig {
         let db_exists = self.db_path.exists();
         let mode = if self.serve_state.is_some() {

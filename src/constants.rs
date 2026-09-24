@@ -104,6 +104,18 @@ pub const INDEX_THREADS_ENV: &str = "CODESEARCH_INDEX_THREADS";
 /// Env var choosing the indexing pool's QoS: `background` (default) or `utility`.
 pub const INDEX_QOS_ENV: &str = "CODESEARCH_INDEX_QOS";
 
+/// Env var capping concurrent index jobs across all repos (default 1).
+pub const INDEX_MAX_JOBS_ENV: &str = "CODESEARCH_INDEX_MAX_JOBS";
+
+/// Env var for the tool-call latency target; slower calls pause indexing (default 1000).
+pub const READ_LATENCY_TARGET_MS_ENV: &str = "CODESEARCH_READ_LATENCY_TARGET_MS";
+
+/// Env var: background indexing waits while other processes use more CPU than this percent (default 70).
+pub const INDEX_MAX_OTHER_CPU_ENV: &str = "CODESEARCH_INDEX_MAX_OTHER_CPU";
+
+/// Env var: `true` pauses background indexing on battery power (default false).
+pub const INDEX_PAUSE_ON_BATTERY_ENV: &str = "CODESEARCH_INDEX_PAUSE_ON_BATTERY";
+
 /// Env var overriding the location of the global codesearchignore file.
 pub const GLOBAL_CODESEARCHIGNORE_ENV: &str = "CODESEARCH_GLOBAL_IGNORE";
 

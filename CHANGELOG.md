@@ -14,7 +14,7 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
-## [1.4.10]
+## [1.5.0] - 2026-09-24
 
 ### Added
 

@@ -342,8 +342,11 @@ On a running `codesearch serve` the same lookup is available over plain REST —
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `kind` | `"index"` \| `"projects"` \| `"health"` | What to query (`health`: tool-call latency and indexing governor state) |
+| `kind` | `"index"` \| `"projects"` \| `"health"` \| `"latency"` \| `"repos"` \| `"events"` | What to query. `health`: overall `ok`/`degraded` with reasons, tool-call latency, indexing governor state, repo counts. `latency`: bucketed latency history. `repos`: per-repo index health (serve only). `events`: recent index and governor events |
 | `project` / `group` | string | Multi-repo routing |
+| `hours` / `bucket_minutes` | integer | `kind="latency"`: window (1-24h, default 6) and bucket size (1-240 min, default 10) |
+| `query` / `repo_status` | string | `kind="repos"`: exact alias or path substring; status filter (`failing`, `indexing`, `queued`, `open`, ...) |
+| `limit` | integer | `kind="events"`: number of events, newest first (1-500, default 50) |
 
 ## Serve Mode (Multi-Repo)
 
@@ -355,9 +358,32 @@ codesearch serve
 
 This starts a background HTTP server with:
 - **TUI dashboard** (ratatui) showing repo status, CPU usage, active sessions
+- **Health dashboard** at `http://127.0.0.1:39725/dashboard` — see [Health dashboard](#health-dashboard)
 - **Lazy filesystem watchers** — activated on first query per repo
 - **Idle eviction** (30min) — unused repos are unloaded from memory
 - **Session tracking** via MCP keep-alive
+
+### Health dashboard
+
+`GET /dashboard` answers "why is codesearch slow or stale?" in a browser: overall `ok`/`degraded` with reasons, tool-call latency p50/p95/p98/p99/p100 over the last 1, 6 or 24 hours against the SLO and read target, per-tool latency, what the indexing governor is running or waiting on and why it is paused, every repo's last index result, and recent index events. It refreshes every 15 seconds and loads nothing from the network.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/health-dashboard-dark.png">
+  <img alt="Health dashboard: degraded status with a failing repo, tool-call latency chart against the 5s SLO and 1s read target, per-tool percentiles, repositories and index events" src="docs/images/health-dashboard.png">
+</picture>
+
+Status is `degraded` when tool-call p95 over the last hour exceeds `CODESEARCH_SLO_MS` (default 5000), any tool call failed in the last hour, or a repo's last index job failed. A repo is `failing` after a failed index job until its next successful one; jobs cancelled because the repo was removed or evicted do not count. Latency history and events live in memory (24h of tool calls, the last 500 events) and reset when serve restarts.
+
+The page reads a read-only JSON API with the same auth as `/status` (open on localhost, bearer key on network binds):
+
+| Endpoint | Returns |
+|----------|---------|
+| `GET /api/summary` | `status`, `reasons`, `slo_ms`, `read_target_ms`, `latency_5m` / `latency_1h` (overall and per tool), `index_governor`, `qos`, repo counts (`total`, `indexing`, `failing`, `queued`) |
+| `GET /api/latency?hours=6&bucket_minutes=10` | Latency buckets (`start_ms`, `count`, `failures`, `p50`..`p100`); `hours` 1-24, `bucket_minutes` 1-240 |
+| `GET /api/repos?q=&status=` | Per repo: `alias`, `path`, `status`, `changes`, `queued`, `indexed_at_ms`, `duration_ms`, `failures`, `error`. `q` is an exact alias or a path substring; `status` also accepts `queued` |
+| `GET /api/events?limit=50` | Newest first: index jobs finished/failed/cancelled, governor pauses and resumes, starvation overrides (`ts_ms`, `level`, `msg`, `repo`, `duration_ms`) |
+
+Agents get the same data from the MCP `status` tool: `kind="health"`, `"latency"`, `"repos"` and `"events"`.
 
 ### TUI Keyboard Shortcuts
 
@@ -587,6 +613,7 @@ In the `codesearch serve` TUI, mounts appear in **italic/cyan**, distinguishing 
 | `CODESEARCH_INDEX_QOS` | Indexing pool priority: `utility` (default) or `background` (Apple Silicon efficiency cores only: gentlest, ~4-6x slower indexing) |
 | `CODESEARCH_INDEX_MAX_OTHER_CPU` | Background indexing waits while other processes use more than this % CPU (default: 70) |
 | `CODESEARCH_INDEX_PAUSE_ON_BATTERY` | `true` pauses background indexing on battery (default: false) |
+| `CODESEARCH_SLO_MS` | Tool-call p95 SLO the [health dashboard](#health-dashboard) and `status(kind="health")` judge against (default: 5000) |
 | `RUST_LOG` | Log level (e.g. `codesearch=debug`) |
 
 ### Read-path QoS and indexing throttling
@@ -597,7 +624,7 @@ Tool calls must stay fast while repos index. Serve separates the two paths:
 - **Indexing runs on its own low-priority pool.** Chunking, embedding and HNSW builds run on `CODESEARCH_INDEX_THREADS` threads at `CODESEARCH_INDEX_QOS` (macOS QoS classes, Linux `nice`); tool calls run at user-initiated priority.
 - **A governor admits index jobs.** At most `CODESEARCH_INDEX_MAX_JOBS` run at once (never two for the same repo); explicit requests (`POST /repos`, reindex, TUI) go before watcher batches, which go before background refreshes. Between batches a job pauses while a recent tool call exceeded the read target, memory pressure is high, or (background work only) other processes are busy. Every pause is capped (30s explicit, 2 min watcher, 10 min background) so indexing always finishes.
 
-`GET /status` reports `latency` (p50/p95/p98/p99/p100 per tool, last hour), `qos`, and `index_governor` (running/waiting jobs and why a job is paused). The MCP `status` tool exposes the same with `kind="health"`.
+`GET /status` reports `latency` (p50/p95/p98/p99/p100 per tool, last hour), `qos`, and `index_governor` (running/waiting jobs and why a job is paused). The MCP `status` tool exposes the same with `kind="health"`, and the [health dashboard](#health-dashboard) charts it over time.
 
 ### `.codesearchignore`
 

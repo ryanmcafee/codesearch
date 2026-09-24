@@ -16,6 +16,13 @@ finalized in place with a date — no renaming/migration step needed.
 
 ## [1.4.10]
 
+### Added
+
+- **Health dashboard at `GET /dashboard`.** One page shows overall `ok`/`degraded` with reasons, tool-call p50/p95/p98/p99/p100 over 1/6/24 hours against the SLO (`CODESEARCH_SLO_MS`, default 5000) and read target, per-tool latency, the indexing governor's running/waiting jobs and pause reason, each repo's last index result (indexed at, duration, consecutive failures, error, queued), and recent index events. Served from the binary, no network assets.
+- **Health JSON API:** `/api/summary`, `/api/latency?hours=&bucket_minutes=`, `/api/repos?q=&status=`, `/api/events?limit=`. Read-only, same auth as `/status`.
+- **MCP `status` kinds `latency`, `repos` and `events`;** `kind="health"` adds `status`, `reasons`, `slo_ms` and repo counts.
+- Index jobs record their outcome and the governor logs pauses, resumes and starvation overrides to a bounded in-memory event log; cancelled jobs are not counted as failures. Tool-call latency is kept for 24h (was 1h); headline percentiles still cover the last hour.
+
 ### Changed
 
 - **Searches no longer wait on indexing.** Reads take no lock: they see the last committed LMDB/tantivy snapshot, and every index update (delete + insert + incremental HNSW build) commits in one write transaction (`VectorStore::replace_chunks`). Previously a fair `RwLock` queued every search behind in-flight writes and HNSW builds, and inserts committed before the build so readers briefly got "Index not built". Changed files stay searchable while a refresh runs instead of being deleted up front.

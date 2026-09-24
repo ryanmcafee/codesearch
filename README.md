@@ -583,8 +583,8 @@ In the `codesearch serve` TUI, mounts appear in **italic/cyan**, distinguishing 
 | `CODESEARCH_GLOBAL_IGNORE` | Path to the global ignore file (default: `~/.codesearch/.codesearchignore`) |
 | `CODESEARCH_READ_LATENCY_TARGET_MS` | Tool-call latency target; a `search`/`find`/`explore`/`get_chunk` slower than this pauses indexing for 30s (default: 1000) — see [Read-path QoS](#read-path-qos-and-indexing-throttling) |
 | `CODESEARCH_INDEX_MAX_JOBS` | Index jobs that may run at once across all repos (default: 1) |
-| `CODESEARCH_INDEX_THREADS` | Threads in the indexing pool (default: cores / 4, 1–4) |
-| `CODESEARCH_INDEX_QOS` | Indexing pool priority: `background` (default; Apple Silicon efficiency cores) or `utility` |
+| `CODESEARCH_INDEX_THREADS` | Threads in the indexing pool (default: cores / 2, 1–4) |
+| `CODESEARCH_INDEX_QOS` | Indexing pool priority: `utility` (default) or `background` (Apple Silicon efficiency cores only: gentlest, ~4-6x slower indexing) |
 | `CODESEARCH_INDEX_MAX_OTHER_CPU` | Background indexing waits while other processes use more than this % CPU (default: 70) |
 | `CODESEARCH_INDEX_PAUSE_ON_BATTERY` | `true` pauses background indexing on battery (default: false) |
 | `RUST_LOG` | Log level (e.g. `codesearch=debug`) |

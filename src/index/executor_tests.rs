@@ -64,15 +64,15 @@ fn configured_threads_honours_the_env_and_rejects_zero() {
 
 #[test]
 #[serial]
-fn configured_qos_defaults_to_background_and_parses_utility() {
+fn configured_qos_defaults_to_utility_and_parses_background() {
     let _env = EnvRestore::remove(&[crate::constants::INDEX_QOS_ENV]);
-    assert_eq!(configured_qos(), ThreadQos::Background);
-    drop(_env);
-
-    let _env = EnvRestore::set(&[(crate::constants::INDEX_QOS_ENV, "utility")]);
     assert_eq!(configured_qos(), ThreadQos::Utility);
     drop(_env);
 
-    let _env = EnvRestore::set(&[(crate::constants::INDEX_QOS_ENV, "turbo")]);
+    let _env = EnvRestore::set(&[(crate::constants::INDEX_QOS_ENV, "background")]);
     assert_eq!(configured_qos(), ThreadQos::Background);
+    drop(_env);
+
+    let _env = EnvRestore::set(&[(crate::constants::INDEX_QOS_ENV, "turbo")]);
+    assert_eq!(configured_qos(), ThreadQos::Utility);
 }

@@ -136,7 +136,7 @@ fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
         .unwrap_or_else(|| "non-string panic payload".to_string())
 }
 
-/// Pool size from `CODESEARCH_INDEX_THREADS`, else a quarter of the cores (1..=4).
+/// Pool size from `CODESEARCH_INDEX_THREADS`, else half the cores (1..=4).
 pub fn configured_threads() -> usize {
     std::env::var(crate::constants::INDEX_THREADS_ENV)
         .ok()
@@ -144,21 +144,21 @@ pub fn configured_threads() -> usize {
         .filter(|&n| n > 0)
         .unwrap_or_else(|| {
             let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
-            (cores / 4).clamp(1, 4)
+            (cores / 2).clamp(1, 4)
         })
 }
 
-/// Pool QoS from `CODESEARCH_INDEX_QOS` (`background` | `utility`), default background.
+/// Pool QoS from `CODESEARCH_INDEX_QOS` (`utility` | `background`), default utility.
 pub fn configured_qos() -> ThreadQos {
     match std::env::var(crate::constants::INDEX_QOS_ENV) {
         Ok(value) => ThreadQos::parse(&value).unwrap_or_else(|| {
             tracing::warn!(
-                "{}={value:?} is not background|utility|user-initiated; using background",
+                "{}={value:?} is not utility|background|user-initiated; using utility",
                 crate::constants::INDEX_QOS_ENV
             );
-            ThreadQos::Background
+            ThreadQos::Utility
         }),
-        Err(_) => ThreadQos::Background,
+        Err(_) => ThreadQos::Utility,
     }
 }
 

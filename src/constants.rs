@@ -98,10 +98,10 @@ pub fn get_global_cache_dir() -> PathBuf {
     cache_dir
 }
 
-/// Env var sizing the low-priority indexing thread pool (default: cores / 4, 1..=4).
+/// Env var sizing the low-priority indexing thread pool (default: cores / 2, 1..=4).
 pub const INDEX_THREADS_ENV: &str = "CODESEARCH_INDEX_THREADS";
 
-/// Env var choosing the indexing pool's QoS: `background` (default) or `utility`.
+/// Env var choosing the indexing pool's QoS: `utility` (default) or `background`.
 pub const INDEX_QOS_ENV: &str = "CODESEARCH_INDEX_QOS";
 
 /// Env var capping concurrent index jobs across all repos (default 1).

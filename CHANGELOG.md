@@ -14,6 +14,23 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.4.10]
+
+### Changed
+
+- **Searches no longer wait on indexing.** Reads take no lock: they see the last committed LMDB/tantivy snapshot, and every index update (delete + insert + incremental HNSW build) commits in one write transaction (`VectorStore::replace_chunks`). Previously a fair `RwLock` queued every search behind in-flight writes and HNSW builds, and inserts committed before the build so readers briefly got "Index not built". Changed files stay searchable while a refresh runs instead of being deleted up front.
+- **Indexing runs on a dedicated low-priority pool.** Chunking, embedding and HNSW builds run on `CODESEARCH_INDEX_THREADS` threads (default cores/4, 1-4) at `CODESEARCH_INDEX_QOS` (`background` default, or `utility`; macOS QoS classes, Linux `nice`), with single-threaded ONNX per pool thread; tool calls run at user-initiated priority. `/status` reports `qos`.
+- **Governed indexing.** At most `CODESEARCH_INDEX_MAX_JOBS` (default 1) index jobs run at once, never two for one repo; explicit requests (`POST /repos`, reindex, TUI) go first, then watcher batches, then background refreshes. Between batches a job pauses while a recent `search`/`find`/`explore`/`get_chunk` exceeded `CODESEARCH_READ_LATENCY_TARGET_MS` (default 1000), memory pressure is high, or other processes are busy / on battery (background only; `CODESEARCH_INDEX_MAX_OTHER_CPU`, `CODESEARCH_INDEX_PAUSE_ON_BATTERY`). Every pause is capped so indexing always finishes.
+- **Tool-call latency telemetry.** `/status` and `status(kind="health")` report p50/p95/p98/p99/p100 per tool (last hour) and the governor's running/waiting jobs, including why a job is paused.
+- Startup warmup releases the per-repo open lock before its incremental refresh, so queries no longer wait for it.
+
+### Fixed
+
+- **File watcher now applies the same ignore rules as the full walk:** nested `.gitignore`/`.codesearchignore`/`.osgrepignore`, `core.excludesFile`, hidden paths, ignore-file edits, and macOS `/private/var` event paths. Refreshes also drop tracked files the walk no longer yields, so files indexed by mistake are cleaned up.
+- **One persistent embedding cache per model per process.** A second `EmbeddingService` used to trip the LMDB double-open guard and run with no cache.
+- **The pre-push QC gate no longer mutates the repository.** git exports `GIT_DIR` to hooks; tests that shell out to git inherited it and committed a fixture onto the pushed branch and set `core.bare=true` in `.git/config`.
+- Tests are hermetic on macOS with commit signing (`CODESEARCH_GLOBAL_IGNORE` override for the global ignore file).
+
 ## [1.4.9] - 2026-09-23
 
 ### Changed

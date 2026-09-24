@@ -369,7 +369,7 @@ This starts a background HTTP server with:
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/health-dashboard-dark.png">
-  <img alt="Health dashboard: degraded status with a failing repo, tool-call latency chart against the 5s SLO and 1s read target, per-tool percentiles, repositories and index events" src="docs/images/health-dashboard.png">
+  <img alt="Health dashboard: ok status, tool-call latency chart against the 5s SLO and 1s read target, per-tool percentiles, repositories and index events" src="docs/images/health-dashboard.png">
 </picture>
 
 Status is `degraded` when tool-call p95 over the last hour exceeds `CODESEARCH_SLO_MS` (default 5000), any tool call failed in the last hour, or a repo's last index job failed. A repo is `failing` after a failed index job until its next successful one; jobs cancelled because the repo was removed or evicted do not count. Latency history and events live in memory (24h of tool calls, the last 500 events) and reset when serve restarts.

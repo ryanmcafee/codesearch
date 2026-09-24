@@ -4,11 +4,13 @@
 use serde::Serialize;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-/// Samples older than this are dropped.
-pub const RETENTION: Duration = Duration::from_secs(60 * 60);
-const MAX_SAMPLES: usize = 50_000;
+/// Samples older than this are dropped; also the longest dashboard window.
+pub const RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+/// Window for the headline percentiles in `/status` and `status(kind="health")`.
+pub const SUMMARY_WINDOW: Duration = Duration::from_secs(60 * 60);
+const MAX_SAMPLES: usize = 100_000;
 const PERCENTILES: [u8; 5] = [50, 95, 98, 99, 100];
 
 /// Grep-style tools whose latency the indexing governor protects. `find_impact`
@@ -66,6 +68,21 @@ pub struct LatencySummary {
     pub by_tool: BTreeMap<String, LatencyStats>,
 }
 
+/// One time bucket of a latency series; `start_ms` is Unix epoch milliseconds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LatencyBucket {
+    pub start_ms: u64,
+    #[serde(flatten)]
+    pub stats: LatencyStats,
+}
+
+/// Current wall clock as Unix epoch milliseconds.
+pub fn unix_ms_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
 #[derive(Default)]
 pub struct LatencyRecorder {
     samples: Mutex<VecDeque<Sample>>,
@@ -107,6 +124,39 @@ impl LatencyRecorder {
                 .map(|(tool, s)| (tool.to_string(), LatencyStats::from_samples(s.into_iter())))
                 .collect(),
         }
+    }
+
+    /// `window` split into `bucket`-wide slices ending at `now`, oldest first.
+    /// `now_unix_ms` is the wall clock at `now`, used to label bucket starts.
+    pub fn series_at(
+        &self,
+        now: Instant,
+        now_unix_ms: u64,
+        window: Duration,
+        bucket: Duration,
+    ) -> Vec<LatencyBucket> {
+        let bucket_ms = u64::try_from(bucket.as_millis()).unwrap_or(u64::MAX).max(1);
+        let window_ms = u64::try_from(window.as_millis()).unwrap_or(u64::MAX);
+        let count = usize::try_from(window_ms.div_ceil(bucket_ms)).unwrap_or(usize::MAX);
+        let span_ms = bucket_ms.saturating_mul(count as u64);
+        let mut slices: Vec<Vec<&Sample>> = vec![Vec::new(); count];
+        let samples = self.samples.lock().unwrap_or_else(|e| e.into_inner());
+        for sample in samples.iter() {
+            let age_ms = u64::try_from(now.saturating_duration_since(sample.at).as_millis())
+                .unwrap_or(u64::MAX);
+            if age_ms < span_ms {
+                slices[count - 1 - usize::try_from(age_ms / bucket_ms).unwrap_or(0)].push(sample);
+            }
+        }
+        let origin = now_unix_ms.saturating_sub(span_ms);
+        slices
+            .into_iter()
+            .enumerate()
+            .map(|(i, slice)| LatencyBucket {
+                start_ms: origin + bucket_ms * i as u64,
+                stats: LatencyStats::from_samples(slice.into_iter()),
+            })
+            .collect()
     }
 
     /// Slowest call to one of `tools` finishing within `within` of `now`, if any.

@@ -601,8 +601,9 @@ impl IndexManager {
         cancel_token: &CancellationToken,
     ) -> Result<()> {
         governor::global()
-            .run_exclusive(
+            .run_job(
                 &codebase_path.display().to_string(),
+                cancel_token,
                 Self::perform_incremental_refresh_governed(
                     codebase_path,
                     db_path,
@@ -1860,7 +1861,7 @@ impl IndexManager {
         );
         governor::with_priority(
             IndexPriority::Watcher,
-            governor::global().run_exclusive(&codebase_path.display().to_string(), job),
+            governor::global().run_job(&codebase_path.display().to_string(), cancel_token, job),
         )
         .await
     }
@@ -2029,7 +2030,7 @@ impl IndexManager {
         let job = Self::refresh_index_governed(codebase_path, db_path, stores, cancel_token);
         governor::with_priority(
             IndexPriority::Watcher,
-            governor::global().run_exclusive(&codebase_path.display().to_string(), job),
+            governor::global().run_job(&codebase_path.display().to_string(), cancel_token, job),
         )
         .await
     }

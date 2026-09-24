@@ -110,6 +110,9 @@ pub const INDEX_MAX_JOBS_ENV: &str = "CODESEARCH_INDEX_MAX_JOBS";
 /// Env var for the tool-call latency target; slower calls pause indexing (default 1000).
 pub const READ_LATENCY_TARGET_MS_ENV: &str = "CODESEARCH_READ_LATENCY_TARGET_MS";
 
+/// Env var for the tool-call p95 SLO (ms) the health dashboard judges against (default 5000).
+pub const SLO_MS_ENV: &str = "CODESEARCH_SLO_MS";
+
 /// Env var: background indexing waits while other processes use more CPU than this percent (default 70).
 pub const INDEX_MAX_OTHER_CPU_ENV: &str = "CODESEARCH_INDEX_MAX_OTHER_CPU";
 
@@ -418,6 +421,21 @@ pub const CHUNK_PATH: &str = "/chunk/{id}";
 /// POST a `FindImpactRequest` body; returns the tool's JSON payload
 /// (busy envelope and index-freshness fields included).
 pub const FIND_IMPACT_PATH: &str = "/find-impact";
+
+/// Health dashboard page served by `codesearch serve`.
+pub const DASHBOARD_PATH: &str = "/dashboard";
+
+/// Health API: overall status, last-hour latency, governor and repo counts.
+pub const API_SUMMARY_PATH: &str = "/api/summary";
+
+/// Health API: bucketed tool-call latency, `?hours=&bucket_minutes=`.
+pub const API_LATENCY_PATH: &str = "/api/latency";
+
+/// Health API: per-repo index health, `?q=&status=`.
+pub const API_REPOS_PATH: &str = "/api/repos";
+
+/// Health API: recent index and governor events, `?limit=`.
+pub const API_EVENTS_PATH: &str = "/api/events";
 
 /// How long an open repo may remain idle (no queries) before it is evicted.
 /// Eviction closes the DB handles, stops the FSW, and releases memory.

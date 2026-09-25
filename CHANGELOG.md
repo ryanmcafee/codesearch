@@ -14,6 +14,16 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.6.0]
+
+### Added
+
+- **Prometheus `/metrics` endpoint on `codesearch serve`.** Text exposition format 0.0.4 with the same auth as `/status`: a cumulative tool-call duration histogram and failure counter per tool, windowed percentile gauges matching the dashboard, overall status, indexing governor jobs and inputs, QoS, per-repo index gauges, index event counters and process RSS/CPU. Labels are bounded (unknown tools fold into `tool="other"`, pause reasons into five categories, no error text).
+
+### Changed
+
+- **The health dashboard reads its numbers from `/metrics`.** Status, latency tiles, the per-tool table, governor, QoS and the repo table come from the Prometheus endpoint; the latency chart, event log, degraded reasons and index errors still use the JSON API, which is unchanged.
+
 ## [1.5.2] - 2026-09-25
 
 ### Changed

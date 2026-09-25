@@ -359,6 +359,7 @@ codesearch serve
 This starts a background HTTP server with:
 - **TUI dashboard** (ratatui) showing repo status, CPU usage, active sessions
 - **Health dashboard** at `http://127.0.0.1:39725/dashboard` — see [Health dashboard](#health-dashboard)
+- **Prometheus metrics** at `http://127.0.0.1:39725/metrics` - see [Prometheus metrics](#prometheus-metrics)
 - **Lazy filesystem watchers** — activated on first query per repo
 - **Idle eviction** (30min) — unused repos are unloaded from memory
 - **Session tracking** via MCP keep-alive
@@ -374,7 +375,7 @@ This starts a background HTTP server with:
 
 Status is `degraded` when tool-call p95 over the last hour exceeds `CODESEARCH_SLO_MS` (default 5000), any tool call failed in the last hour, or a repo's last index job failed. A repo is `failing` after a failed index job until its next successful one; jobs cancelled because the repo was removed or evicted do not count. Latency history and events live in memory (24h of tool calls, the last 500 events) and reset when serve restarts.
 
-The page reads a read-only JSON API with the same auth as `/status` (open on localhost, bearer key on network binds):
+The page reads its numbers from [`/metrics`](#prometheus-metrics) and, for the latency chart, event log, degraded reasons and index errors, a read-only JSON API. Both have the same auth as `/status` (open on localhost, bearer key on network binds):
 
 | Endpoint | Returns |
 |----------|---------|
@@ -384,6 +385,47 @@ The page reads a read-only JSON API with the same auth as `/status` (open on loc
 | `GET /api/events?limit=50` | Newest first: index jobs finished/failed/cancelled, governor pauses and resumes, starvation overrides (`ts_ms`, `level`, `msg`, `repo`, `duration_ms`) |
 
 Agents get the same data from the MCP `status` tool: `kind="health"`, `"latency"`, `"repos"` and `"events"`.
+
+### Prometheus metrics
+
+`GET /metrics` serves the same telemetry in the Prometheus text exposition format 0.0.4, with the same auth as `/status`:
+
+```yaml
+scrape_configs:
+  - job_name: codesearch
+    scrape_interval: 30s
+    static_configs:
+      - targets: ["127.0.0.1:39725"]
+    # Network binds only:
+    # authorization:
+    #   credentials: <CODESEARCH_SERVE_API_KEY>
+```
+
+| Metric | Type | Labels |
+|--------|------|--------|
+| `codesearch_build_info` | gauge | `version` |
+| `codesearch_uptime_seconds`, `codesearch_slo_seconds`, `codesearch_read_target_seconds` | gauge | |
+| `codesearch_status` | gauge | `status` (`ok`, `degraded`); a stopped serve shows as `up == 0` |
+| `codesearch_degraded_reasons` | gauge | |
+| `codesearch_tool_call_duration_seconds` | histogram | `tool`; buckets 0.01s-30s, cumulative since start |
+| `codesearch_tool_call_failures_total` | counter | `tool` |
+| `codesearch_tool_call_latency_seconds` | gauge | `tool` (`all` = every call), `window` (`5m`, `1h`, `6h`, `24h`), `percentile` (`50`, `95`, `98`, `99`, `100`) |
+| `codesearch_tool_call_window_calls`, `codesearch_tool_call_window_failures` | gauge | `tool`, `window` |
+| `codesearch_index_governor_max_jobs` | gauge | |
+| `codesearch_index_governor_jobs` | gauge | `state` (`running`, `waiting`) |
+| `codesearch_index_governor_job_seconds` | gauge | `repo`, `priority`, `state` |
+| `codesearch_index_governor_paused_jobs` | gauge | `reason` (`read_latency`, `memory_pressure`, `cpu`, `battery`, `other`) |
+| `codesearch_index_governor_recent_read_max_seconds`, `codesearch_index_governor_other_cpu_ratio`, `codesearch_index_governor_on_battery` | gauge | |
+| `codesearch_index_governor_memory_pressure` | gauge | `level` (`normal`, `warn`, `critical`) |
+| `codesearch_qos_info` | gauge | `read`, `index` |
+| `codesearch_index_threads` | gauge | |
+| `codesearch_repos`, `codesearch_repos_indexing`, `codesearch_repos_failing`, `codesearch_repos_queued` | gauge | |
+| `codesearch_repo_info` | gauge | `repo`, `path`, `status` |
+| `codesearch_repo_last_indexed_timestamp_seconds`, `codesearch_repo_last_index_duration_seconds`, `codesearch_repo_index_consecutive_failures`, `codesearch_repo_pending_changes`, `codesearch_repo_indexing`, `codesearch_repo_queued` | gauge | `repo` |
+| `codesearch_index_events_total` | counter | `level` (`info`, `warn`, `error`) |
+| `process_resident_memory_bytes`, `process_cpu_seconds_total` | gauge, counter | |
+
+`tool` is one of `search`, `find`, `explore`, `get_chunk`, `status`, `find_impact` or `other`. Error text and pause reasons stay out of labels; read them from `/api/repos` and `/api/summary`. Prefer `histogram_quantile()` over the histogram for alerting; the windowed percentile gauges mirror the dashboard numbers.
 
 ### TUI Keyboard Shortcuts
 

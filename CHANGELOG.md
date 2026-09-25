@@ -14,6 +14,17 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.6.0]
+
+### Changed
+
+- **Multi-repo `search` and `find` read repos in parallel.** Multi-repo fan-out (vector, BM25 and exact-identifier reads) runs on a bounded read-priority pool, so latency tracks the slowest repo instead of the sum of all of them. Result order, per-repo dedup and failure warnings are unchanged.
+- **Cold group queries open repos concurrently.** The first fan-out after start-up or idle eviction opens up to 8 repos at a time instead of one by one, and the per-open index health check no longer queues behind indexing work.
+
+### Added
+
+- **Search latency benchmarks.** `cargo bench --bench search_fanout` measures single-repo, group fan-out and cold-open search on synthetic stores; `scripts/bench-live.mjs` reports p50/p95/p99 and PASS/FAIL against the 5s p95 SLO for a running serve.
+
 ## [1.5.2] - 2026-09-25
 
 ### Changed

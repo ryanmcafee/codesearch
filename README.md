@@ -626,6 +626,11 @@ Tool calls must stay fast while repos index. Serve separates the two paths:
 
 `GET /status` reports `latency` (p50/p95/p98/p99/p100 per tool, last hour), `qos`, and `index_governor` (running/waiting jobs and why a job is paused). The MCP `status` tool exposes the same with `kind="health"`, and the [health dashboard](#health-dashboard) charts it over time.
 
+### Search latency benchmarks
+
+- `cargo bench --bench search_fanout` -- single-repo, group fan-out (8/32/64 repos) and cold-open search on synthetic temp-dir stores. Size with `CODESEARCH_BENCH_STORES` / `CODESEARCH_BENCH_CHUNKS`. Compare runs with `--save-baseline <name>` / `--baseline <name>`.
+- `node scripts/bench-live.mjs [--url <serve>] [--runs 20] [--project <alias>]` -- read-only MCP `search` calls against a running serve (unscoped semantic, unscoped literal, one project); prints p50/p95/p99/max and exits non-zero when p95 exceeds `--slo-ms` (default 5000).
+
 ### `.codesearchignore`
 
 Place in repo root. Gitignore syntax. Excludes paths from indexing:

@@ -12,6 +12,50 @@ pub(crate) trait HasScore {
     fn score(&self) -> f32;
 }
 
+/// A fan-out hit tagged with the index of the store (in `stores_vec`) that produced it.
+///
+/// Chunk ids are allocated per store from 0, so a bare id is ambiguous across
+/// a group: resolve and fuse by [`StoreHit::key`], never by `chunk_id` alone.
+#[derive(Debug, Clone)]
+pub(crate) struct StoreHit<R> {
+    pub(crate) store_idx: usize,
+    pub(crate) hit: R,
+}
+
+/// Tag single-store results so both routing paths share one hit type.
+pub(crate) fn single_store_hits<R>(results: Vec<R>) -> Vec<StoreHit<R>> {
+    results
+        .into_iter()
+        .map(|hit| StoreHit { store_idx: 0, hit })
+        .collect()
+}
+
+/// Dedup identity of a hit: the chunk id within one store, (store, chunk id) across a group.
+pub(crate) trait HasHitKey {
+    type Key: Eq + std::hash::Hash + Copy;
+    fn key(&self) -> Self::Key;
+}
+
+impl HasHitKey for crate::fts::FtsResult {
+    type Key = u32;
+    fn key(&self) -> u32 {
+        self.chunk_id
+    }
+}
+
+impl<R: HasChunkId> HasHitKey for StoreHit<R> {
+    type Key = (usize, u32);
+    fn key(&self) -> (usize, u32) {
+        (self.store_idx, self.hit.chunk_id())
+    }
+}
+
+impl<R: HasScore> HasScore for StoreHit<R> {
+    fn score(&self) -> f32 {
+        self.hit.score()
+    }
+}
+
 impl HasChunkId for crate::vectordb::SearchResult {
     fn chunk_id(&self) -> u32 {
         self.id

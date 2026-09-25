@@ -80,13 +80,14 @@ impl CodesearchService {
         if let Some(ref sv) = ctx.stores_vec {
             let aliases = ctx.aliases();
             let mut all_items: Vec<FileOutlineItem> = Vec::new();
-            let mut seen_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
+            let mut seen_ids: std::collections::HashSet<(usize, u32)> =
+                std::collections::HashSet::new();
             for (store_idx, store_arc) in sv.iter().enumerate() {
                 let store = &store_arc.vector_store;
                 match store.chunks_for_file(normalized) {
                     Ok(metas) => {
                         for c in metas {
-                            if seen_ids.insert(c.id) {
+                            if seen_ids.insert((store_idx, c.id)) {
                                 all_items.push(FileOutlineItem {
                                     chunk_id: c.id,
                                     kind: c.kind,

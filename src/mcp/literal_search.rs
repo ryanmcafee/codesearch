@@ -85,11 +85,20 @@ impl CodesearchService {
             if let Some(ref sv) = ctx.stores_vec {
                 // Multi-store scan
                 let mut items: Vec<LiteralSearchResultItem> = Vec::new();
-                for store_arc in sv {
+                for (store_idx, store_arc) in sv.iter().enumerate() {
                     let store = &store_arc.vector_store;
                     let all_chunks = match store.iter_all_chunks() {
                         Ok(chunks) => chunks,
-                        Err(_) => continue,
+                        Err(ref e) => {
+                            note_store_failure(
+                                &mut literal_warnings,
+                                ctx.aliases(),
+                                store_idx,
+                                "chunk scan",
+                                e,
+                            );
+                            continue;
+                        }
                     };
                     for (_, chunk) in all_chunks {
                         if let Some(ref lang) = lang_filter {
@@ -254,7 +263,7 @@ impl CodesearchService {
                     )
                     .await
                 {
-                    Ok(r) => r,
+                    Ok(r) => single_store_hits(r),
                     Err(e) => {
                         return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                             "Error searching: {e:#}"
@@ -265,64 +274,57 @@ impl CodesearchService {
 
             // Resolve chunk metadata and apply post-filters
             if let Some(ref sv) = ctx.stores_vec {
-                // Multi-store: resolve chunks from all stores
+                // Multi-store: resolve each hit in the store that produced it
+                let sa = ctx.store_aliases.as_ref().unwrap();
                 let mut items: Vec<LiteralSearchResultItem> = Vec::new();
-                'outer: for fts_result in &fts_results {
-                    let sa = ctx.store_aliases.as_ref().unwrap();
-                    for (idx, store_arc) in sv.iter().enumerate() {
-                        let store = &store_arc.vector_store;
-                        let looked_up = store.get_chunk(fts_result.chunk_id);
-                        if let Err(ref e) = looked_up {
-                            note_store_failure(&mut literal_warnings, sa, idx, "chunk lookup", e);
+                for fts_result in &fts_results {
+                    let Some(chunk) = chunk_for_hit(sv, sa, fts_result, &mut literal_warnings)
+                    else {
+                        continue;
+                    };
+                    if let Some(ref lang) = lang_filter {
+                        let file_lang = Language::from_path(std::path::Path::new(&chunk.path));
+                        if file_lang.name() != lang {
+                            continue;
                         }
-                        if let Some(chunk) = looked_up.ok().flatten() {
-                            if let Some(ref lang) = lang_filter {
-                                let file_lang =
-                                    Language::from_path(std::path::Path::new(&chunk.path));
-                                if file_lang.name() != lang {
-                                    continue;
-                                }
-                            }
-                            if let Some(ref glob) = glob_filter {
-                                let relative_path = chunk
-                                    .path
-                                    .strip_prefix(&project_root_normalized)
-                                    .unwrap_or(&chunk.path)
-                                    .trim_start_matches('/');
-                                if !simple_glob_match(glob, relative_path) {
-                                    continue;
-                                }
-                            }
-                            let match_info = match_line_for_literal(
-                                &chunk.content,
-                                &effective_query,
-                                snippet_regex.as_ref(),
-                            );
-                            if regex_enabled && match_info.is_none() {
-                                continue;
-                            }
-                            let (match_offset, snippet) = match_info.unwrap_or_else(|| {
-                                (0, chunk.content.lines().next().unwrap_or("").to_string())
-                            });
-                            let match_line = chunk.start_line + match_offset;
-                            items.push(LiteralSearchResultItem {
-                                path: chunk.path,
-                                start_line: match_line,
-                                end_line: match_line,
-                                snippet,
-                                score: fts_result.score,
-                                kind: if chunk.kind.is_empty() {
-                                    None
-                                } else {
-                                    Some(chunk.kind)
-                                },
-                                signature: chunk.signature.filter(|s| !s.is_empty()),
-                            });
-                            if items.len() >= limit {
-                                break 'outer;
-                            }
-                            break; // Found in this store
+                    }
+                    if let Some(ref glob) = glob_filter {
+                        let relative_path = chunk
+                            .path
+                            .strip_prefix(&project_root_normalized)
+                            .unwrap_or(&chunk.path)
+                            .trim_start_matches('/');
+                        if !simple_glob_match(glob, relative_path) {
+                            continue;
                         }
+                    }
+                    let match_info = match_line_for_literal(
+                        &chunk.content,
+                        &effective_query,
+                        snippet_regex.as_ref(),
+                    );
+                    if regex_enabled && match_info.is_none() {
+                        continue;
+                    }
+                    let (match_offset, snippet) = match_info.unwrap_or_else(|| {
+                        (0, chunk.content.lines().next().unwrap_or("").to_string())
+                    });
+                    let match_line = chunk.start_line + match_offset;
+                    items.push(LiteralSearchResultItem {
+                        path: chunk.path,
+                        start_line: match_line,
+                        end_line: match_line,
+                        snippet,
+                        score: fts_result.hit.score,
+                        kind: if chunk.kind.is_empty() {
+                            None
+                        } else {
+                            Some(chunk.kind)
+                        },
+                        signature: chunk.signature.filter(|s| !s.is_empty()),
+                    });
+                    if items.len() >= limit {
+                        break;
                     }
                 }
                 items
@@ -338,8 +340,8 @@ impl CodesearchService {
                             let resolved: anyhow::Result<Vec<_>> = fts_results
                                 .iter()
                                 .map(|fts_result| {
-                                    let chunk = store.get_chunk(fts_result.chunk_id)?;
-                                    Ok((chunk, fts_result.score))
+                                    let chunk = store.get_chunk(fts_result.hit.chunk_id)?;
+                                    Ok((chunk, fts_result.hit.score))
                                 })
                                 .collect();
                             let items: Vec<LiteralSearchResultItem> = resolved?

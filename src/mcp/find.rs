@@ -131,7 +131,7 @@ impl CodesearchService {
                 )
                 .await
             {
-                Ok(r) => r,
+                Ok(r) => single_store_hits(r),
                 Err(e) => {
                     return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                         "Error searching: {e:#}"
@@ -157,50 +157,29 @@ impl CodesearchService {
         let mut items: Vec<ReferenceItem> = if let Some(ref sv) = ctx.stores_vec {
             let aliases = ctx.aliases();
             let mut items: Vec<ReferenceItem> = Vec::new();
-            'outer: for fts_result in &fts_results {
-                for (store_idx, store_arc) in sv.iter().enumerate() {
-                    let store = &store_arc.vector_store;
-                    let looked_up = store.get_chunk(fts_result.chunk_id);
-                    if let Err(ref e) = looked_up {
-                        // `Ok(None)` = chunk not in this store (normal during
-                        // fan-out); `Err` = broken store. Skipping the `Err`
-                        // silently made a dead store look like "symbol not
-                        // found" — carry it in the warnings channel instead.
-                        note_store_failure(
-                            &mut find_warnings,
-                            aliases,
-                            store_idx,
-                            "chunk lookup",
-                            e,
-                        );
-                    }
-                    if let Ok(Some(chunk)) = looked_up {
-                        // Skip non-definition kinds — try next FTS result, not next store
-                        if !DEFINITION_KINDS.contains(&chunk.kind.as_str()) {
-                            continue 'outer;
-                        }
-                        if let Some(ref rk) = requested_kind {
-                            if chunk.kind != *rk {
-                                continue 'outer;
-                            }
-                        }
-                        items.push(ReferenceItem {
-                            chunk_id: fts_result.chunk_id,
-                            path: chunk.path,
-                            line: chunk.start_line,
-                            kind: chunk.kind,
-                            signature: chunk.signature,
-                            score: fts_result.score,
-                        });
-                        if items.len() >= limit {
-                            break 'outer;
-                        }
-                        break; // Found in this store — move to next FTS result
+            for fts_result in &fts_results {
+                let Some(chunk) = chunk_for_hit(sv, aliases, fts_result, &mut find_warnings) else {
+                    continue;
+                };
+                if !DEFINITION_KINDS.contains(&chunk.kind.as_str()) {
+                    continue;
+                }
+                if let Some(ref rk) = requested_kind {
+                    if chunk.kind != *rk {
+                        continue;
                     }
                 }
-                // If we get here, the chunk was Ok(None) in every store (not
-                // held anywhere — skip it) or its lookups failed (noted in
-                // find_warnings above).
+                items.push(ReferenceItem {
+                    chunk_id: fts_result.hit.chunk_id,
+                    path: chunk.path,
+                    line: chunk.start_line,
+                    kind: chunk.kind,
+                    signature: chunk.signature,
+                    score: fts_result.hit.score,
+                });
+                if items.len() >= limit {
+                    break;
+                }
             }
             items
         } else {
@@ -214,8 +193,8 @@ impl CodesearchService {
                         let resolved: anyhow::Result<Vec<_>> = fts_results
                             .iter()
                             .map(|fts_result| {
-                                let chunk = store.get_chunk(fts_result.chunk_id)?;
-                                Ok((chunk, fts_result.chunk_id, fts_result.score))
+                                let chunk = store.get_chunk(fts_result.hit.chunk_id)?;
+                                Ok((chunk, fts_result.hit.chunk_id, fts_result.hit.score))
                             })
                             .collect();
                         let items = resolved?
@@ -330,7 +309,7 @@ impl CodesearchService {
                 )
                 .await
             {
-                Ok(r) => r,
+                Ok(r) => single_store_hits(r),
                 Err(e) => {
                     return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                         "Error searching: {e:#}"
@@ -353,33 +332,18 @@ impl CodesearchService {
             let aliases = ctx.aliases();
             let mut items: Vec<ReferenceItem> = Vec::new();
             for fts_result in &fts_results {
-                for (store_idx, store_arc) in sv.iter().enumerate() {
-                    let store = &store_arc.vector_store;
-                    let looked_up = store.get_chunk(fts_result.chunk_id);
-                    if let Err(ref e) = looked_up {
-                        // Same rule as find_definition: `Err` is a broken
-                        // store, not "no usages" — carry it in the channel.
-                        note_store_failure(
-                            &mut find_warnings,
-                            aliases,
-                            store_idx,
-                            "chunk lookup",
-                            e,
-                        );
-                    }
-                    if let Ok(Some(chunk)) = looked_up {
-                        if !is_definition_chunk(&chunk.kind, &chunk.signature, &symbol) {
-                            items.push(ReferenceItem {
-                                chunk_id: fts_result.chunk_id,
-                                path: chunk.path,
-                                line: chunk.start_line,
-                                kind: chunk.kind,
-                                signature: chunk.signature,
-                                score: fts_result.score,
-                            });
-                        }
-                        break;
-                    }
+                let Some(chunk) = chunk_for_hit(sv, aliases, fts_result, &mut find_warnings) else {
+                    continue;
+                };
+                if !is_definition_chunk(&chunk.kind, &chunk.signature, &symbol) {
+                    items.push(ReferenceItem {
+                        chunk_id: fts_result.hit.chunk_id,
+                        path: chunk.path,
+                        line: chunk.start_line,
+                        kind: chunk.kind,
+                        signature: chunk.signature,
+                        score: fts_result.hit.score,
+                    });
                 }
             }
             items
@@ -393,8 +357,8 @@ impl CodesearchService {
                         let resolved: anyhow::Result<Vec<_>> = fts_results
                             .iter()
                             .map(|fts_result| {
-                                let chunk = store.get_chunk(fts_result.chunk_id)?;
-                                Ok((chunk, fts_result.chunk_id, fts_result.score))
+                                let chunk = store.get_chunk(fts_result.hit.chunk_id)?;
+                                Ok((chunk, fts_result.hit.chunk_id, fts_result.hit.score))
                             })
                             .collect();
                         let items = resolved?

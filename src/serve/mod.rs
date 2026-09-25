@@ -6019,3 +6019,7 @@ pub async fn run_serve(
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "group_fanout_tests.rs"]
+mod group_fanout_tests;

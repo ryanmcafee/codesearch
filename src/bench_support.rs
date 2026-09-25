@@ -225,7 +225,7 @@ impl FanoutFixture {
                 &aliases,
                 &ctx.alias_roots,
                 &embeddings,
-                Vec::new(),
+                ctx.skipped_warnings.clone(),
             )
             .await
         {

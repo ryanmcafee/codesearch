@@ -263,3 +263,92 @@ async fn project_scoped_search_does_not_widen_to_all() {
         "project= must stay scoped to one repo: {text}"
     );
 }
+
+/// Reopens the fixture's config in a fresh hub after deleting `repo-a`'s directory.
+fn hub_with_repo_a_deleted(
+    fx: GroupFixture,
+) -> (tempfile::TempDir, Arc<ServeState>, CodesearchService) {
+    let GroupFixture { _tmp: tmp, service } = fx;
+    drop(service);
+    std::fs::remove_dir_all(tmp.path().join("repo-a")).unwrap();
+    let config_file = tmp.path().join("repos.json");
+    let config = ReposConfig::load_from(&config_file).unwrap();
+    let state = Arc::new(ServeState::new(config, Some(config_file)));
+    let service = CodesearchService::new_for_serve(state.clone()).unwrap();
+    (tmp, state, service)
+}
+
+#[tokio::test]
+async fn group_search_skips_repo_whose_root_was_deleted() {
+    for (label, scope) in [
+        ("named group", json!({"group": GROUP})),
+        ("unscoped all", json!({})),
+    ] {
+        for mode in ["literal", "lexical"] {
+            let fx = group_fixture(
+                ("fn alpha() {}", ChunkKind::Function),
+                ("fn beta() {}", ChunkKind::Function),
+            )
+            .await;
+            let (_tmp, state, service) = hub_with_repo_a_deleted(fx);
+            let mut request = json!({"query": "beta", "mode": mode, "compact": false});
+            request
+                .as_object_mut()
+                .unwrap()
+                .extend(scope.as_object().unwrap().clone());
+            let result = if mode == "literal" {
+                service
+                    .search(Parameters(serde_json::from_value(request).unwrap()))
+                    .await
+            } else {
+                // The internal entry point skips `search`'s default-to-all scoping.
+                request
+                    .as_object_mut()
+                    .unwrap()
+                    .entry("group")
+                    .or_insert(json!(crate::constants::ALL_GROUP_NAME));
+                service
+                    .semantic_search(Parameters(serde_json::from_value(request).unwrap()))
+                    .await
+            };
+            let text = text_of(result.unwrap());
+            assert!(
+                text.contains("beta"),
+                "{label}/{mode}: live repo must still answer: {text}"
+            );
+            assert!(
+                text.contains("repo 'repo-a' skipped") && text.contains("no longer exists"),
+                "{label}/{mode}: missing repo must be named in warnings: {text}"
+            );
+            assert!(
+                state.repo_lock_status("repo-a").is_none(),
+                "{label}/{mode}: the deleted repo's store must never be opened"
+            );
+            assert!(
+                state.config_snapshot().resolve("repo-a").is_some(),
+                "{label}/{mode}: the deleted repo must stay registered"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn group_search_with_every_root_deleted_names_them_all() {
+    let fx = group_fixture(
+        ("fn alpha() {}", ChunkKind::Function),
+        ("fn beta() {}", ChunkKind::Function),
+    )
+    .await;
+    let (tmp, _state, service) = hub_with_repo_a_deleted(fx);
+    std::fs::remove_dir_all(tmp.path().join("repo-b")).unwrap();
+    let request =
+        serde_json::from_value(json!({"query": "beta", "mode": "literal", "group": GROUP}))
+            .unwrap();
+    let text = text_of(service.search(Parameters(request)).await.unwrap());
+    assert!(
+        text.contains("No repo in scope can be searched")
+            && text.contains("'repo-a'")
+            && text.contains("'repo-b'"),
+        "an all-missing scope must be an explicit error, not an empty result: {text}"
+    );
+}

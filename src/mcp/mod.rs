@@ -234,6 +234,48 @@ fn merge_exact_into_fts<T: HasHitKey + HasScore>(fts_results: &mut Vec<T>, exact
     }
 }
 
+/// Stores to query, their aliases (parallel), and warnings for registered repos that were skipped.
+type ResolvedStores = (Vec<Arc<SharedStores>>, Vec<String>, Vec<String>);
+
+/// Drop fan-out members whose registered root no longer exists, with one warning per skipped alias.
+///
+/// They stay registered (pruning is `codesearch index rm`'s job); opening and
+/// searching a deleted worktree only costs latency. Errors when nothing is left.
+fn split_missing_roots(
+    cfg: &crate::db_discovery::repos::ReposConfig,
+    aliases: Vec<String>,
+) -> std::result::Result<(Vec<String>, Vec<String>), String> {
+    let (live, missing): (Vec<String>, Vec<String>) = aliases
+        .into_iter()
+        .partition(|alias| cfg.resolve(alias).is_none_or(|root| root.exists()));
+    let warnings: Vec<String> = missing
+        .iter()
+        .map(|alias| {
+            let root = cfg
+                .resolve(alias)
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+            format!(
+                "repo '{alias}' skipped: its root {root} no longer exists \
+                 (still registered; remove it with `codesearch index rm {root}`)"
+            )
+        })
+        .collect();
+    if live.is_empty() && !warnings.is_empty() {
+        return Err(format!(
+            "No repo in scope can be searched:\n  - {}",
+            warnings.join("\n  - ")
+        ));
+    }
+    if !missing.is_empty() {
+        tracing::warn!(
+            "MCP: fan-out skipped repos with missing roots: {:?}",
+            missing
+        );
+    }
+    Ok((live, warnings))
+}
+
 fn alias_at(aliases: &[String], idx: usize) -> &str {
     aliases.get(idx).map(|s| s.as_str()).unwrap_or("unknown")
 }
@@ -1231,7 +1273,7 @@ impl CodesearchService {
         project: &Option<String>,
         group: &Option<String>,
         allow_unscoped: bool,
-    ) -> std::result::Result<Option<(Vec<Arc<SharedStores>>, Vec<String>)>, String> {
+    ) -> std::result::Result<Option<ResolvedStores>, String> {
         // No routing params → resolve based on repo count
         if project.is_none() && group.is_none() {
             if let Some(ref serve_state) = self.serve_state {
@@ -1242,8 +1284,9 @@ impl CodesearchService {
                     return Err(self.format_scope_error());
                 }
                 if !aliases.is_empty() {
+                    let (aliases, skipped) = split_missing_roots(&cfg, aliases)?;
                     let all_stores = open_fanout_stores(serve_state, &aliases).await?;
-                    return Ok(Some((all_stores, aliases)));
+                    return Ok(Some((all_stores, aliases, skipped)));
                 }
                 // No repos configured — fall through to local DB
             }
@@ -1269,7 +1312,7 @@ impl CodesearchService {
 
         if let Some(ref alias) = project {
             let stores = serve_state.get_or_open_stores(alias, true).await?;
-            return Ok(Some((vec![stores], vec![alias.clone()])));
+            return Ok(Some((vec![stores], vec![alias.clone()], Vec::new())));
         }
 
         if let Some(ref group_name) = group {
@@ -1277,8 +1320,9 @@ impl CodesearchService {
             if aliases.is_empty() {
                 return Err(format!("Group '{}' has no members.", group_name));
             }
+            let (aliases, skipped) = split_missing_roots(&serve_state.config_snapshot(), aliases)?;
             let all_stores = open_fanout_stores(serve_state, &aliases).await?;
-            return Ok(Some((all_stores, aliases)));
+            return Ok(Some((all_stores, aliases, skipped)));
         }
 
         Ok(None)
@@ -1301,14 +1345,14 @@ impl CodesearchService {
             .await?;
         let is_multi = resolved
             .as_ref()
-            .is_some_and(|(stores, _)| stores.len() > 1);
+            .is_some_and(|(stores, _, _)| stores.len() > 1);
         let (stores, stores_vec, store_aliases, project_alias) = match &resolved {
             None => (None, None, None, None),
-            Some((store_vec, aliases)) if store_vec.len() == 1 => {
+            Some((store_vec, aliases, _)) if store_vec.len() == 1 => {
                 let alias = aliases.first().cloned();
                 (Some(store_vec[0].clone()), None, None, alias)
             }
-            Some((store_vec, aliases)) => {
+            Some((store_vec, aliases, _)) => {
                 (None, Some(store_vec.clone()), Some(aliases.clone()), None)
             }
         };
@@ -1366,6 +1410,7 @@ impl CodesearchService {
             alias_roots,
             is_multi,
             needs_local_db,
+            skipped_warnings: resolved.map(|(_, _, skipped)| skipped).unwrap_or_default(),
         })
     }
 

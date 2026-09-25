@@ -25,6 +25,10 @@ finalized in place with a date — no renaming/migration step needed.
 
 - **Search latency benchmarks.** `cargo bench --bench search_fanout` measures single-repo, group fan-out and cold-open search on synthetic stores; `scripts/bench-live.mjs` reports p50/p95/p99 and PASS/FAIL against the 5s p95 SLO for a running serve.
 
+### Fixed
+
+- **Group fan-out skips repos whose directory was deleted.** A registered repo whose root no longer exists (e.g. a removed worktree) is left out of `group=` and unscoped fan-out instead of failing the query, and each one is named in the response `warnings`. It stays registered; `codesearch index rm <path>` removes it.
+
 ## [1.5.2] - 2026-09-25
 
 ### Changed

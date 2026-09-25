@@ -164,6 +164,7 @@ impl CodesearchService {
                     ctx.stores_vec.unwrap(),
                     ctx.store_aliases.as_ref().unwrap(),
                     &ctx.alias_roots,
+                    ctx.skipped_warnings.clone(),
                 )
                 .await;
         }
@@ -180,6 +181,7 @@ impl CodesearchService {
                     ctx.stores,
                     ctx.project_alias.as_deref(),
                     &ctx.alias_roots,
+                    ctx.skipped_warnings.clone(),
                 )
                 .await;
         }
@@ -223,7 +225,7 @@ impl CodesearchService {
         // warnings channel since the read-only incident; without the same thing
         // here, `project=<alias>` — the form an agent uses most — still reports
         // a broken store as an ordinary empty result.
-        let mut single_warnings: Vec<String> = Vec::new();
+        let mut single_warnings: Vec<String> = ctx.skipped_warnings.clone();
         // Surface the assumed-model warning even when the store read succeeds:
         // mismatched vector spaces do not error, they just rank wrongly.
         if let Some(warning) = model_resolution.assumed_warning {
@@ -508,6 +510,7 @@ impl CodesearchService {
         stores: Vec<Arc<SharedStores>>,
         aliases: &[String],
         alias_roots: &std::collections::HashMap<String, String>,
+        skipped_warnings: Vec<String>,
     ) -> Result<CallToolResult, McpError> {
         let mode = request.mode.as_deref().unwrap_or("auto");
         let structural_intent = detect_structural_intent(&request.query);
@@ -516,7 +519,7 @@ impl CodesearchService {
         if mode == "lexical" {
             // Lexical has no second backend, so a failed store here is invisible
             // unless it is reported: the query simply looks like it found nothing.
-            let mut lexical_warnings: Vec<String> = Vec::new();
+            let mut lexical_warnings: Vec<String> = skipped_warnings;
 
             let outcome = self
                 .with_fts_store_read_multi(
@@ -606,7 +609,7 @@ impl CodesearchService {
         // Assumed-model warnings, one per repo that records no model. Collected
         // here and folded into `search_warnings` below so an agent sees the
         // assumption alongside the results it applies to.
-        let mut model_warnings: Vec<String> = Vec::new();
+        let mut model_warnings: Vec<String> = skipped_warnings;
         {
             let mut by_model: std::collections::HashMap<crate::embed::ModelType, Vec<f32>> =
                 std::collections::HashMap::new();
@@ -645,6 +648,37 @@ impl CodesearchService {
                 embeddings_by_alias.insert(alias.clone(), embedding);
             }
         }
+
+        self.semantic_search_multi_embedded(
+            request,
+            identifiers,
+            limit,
+            compact,
+            stores,
+            aliases,
+            alias_roots,
+            &embeddings_by_alias,
+            model_warnings,
+        )
+        .await
+    }
+
+    /// Fan-out half of [`Self::semantic_search_multi`], given each repo's query embedding.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn semantic_search_multi_embedded(
+        &self,
+        request: &SemanticSearchRequest,
+        identifiers: &[String],
+        limit: usize,
+        compact: bool,
+        stores: Vec<Arc<SharedStores>>,
+        aliases: &[String],
+        alias_roots: &std::collections::HashMap<String, String>,
+        embeddings_by_alias: &std::collections::HashMap<String, Vec<f32>>,
+        model_warnings: Vec<String>,
+    ) -> Result<CallToolResult, McpError> {
+        let mode = request.mode.as_deref().unwrap_or("auto");
+        let structural_intent = detect_structural_intent(&request.query);
 
         // Search vector stores across all repos, each with its own model's
         // query embedding.
@@ -851,13 +885,14 @@ impl CodesearchService {
         stores: Option<Arc<SharedStores>>,
         project_alias: Option<&str>,
         alias_roots: &std::collections::HashMap<String, String>,
+        skipped_warnings: Vec<String>,
     ) -> Result<CallToolResult, McpError> {
         let structural_intent = detect_structural_intent(&request.query);
 
         // `project=`-scoped queries route here, not through the fan-out
         // (`is_multi` requires >1 store), so this path needs the same failure
         // reporting — it is at least as common as a group query.
-        let mut lexical_warnings: Vec<String> = Vec::new();
+        let mut lexical_warnings: Vec<String> = skipped_warnings;
 
         let mut fts_results = match self
             .with_fts_store_read_for(

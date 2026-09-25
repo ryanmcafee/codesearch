@@ -556,6 +556,8 @@ pub(crate) struct MultiStoreContext {
     pub(crate) is_multi: bool,
     /// True when no serve-state stores resolved and local DB should be checked.
     pub(crate) needs_local_db: bool,
+    /// One warning per registered repo left out of the fan-out because its root is gone.
+    pub(crate) skipped_warnings: Vec<String>,
 }
 
 impl MultiStoreContext {

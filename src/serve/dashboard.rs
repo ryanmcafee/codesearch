@@ -1,5 +1,5 @@
 //! Health dashboard (`GET /dashboard`) and its read-only JSON API:
-//! `/api/summary`, `/api/latency`, `/api/repos` and `/api/events`.
+//! `/api/summary`, `/api/latency`, `/api/repos` and `/api/events`; the page reads its numbers from `/metrics`.
 //! The same builders back the MCP `status` kinds `health`, `latency`, `repos` and `events`.
 
 use axum::extract::{Query, State};

@@ -149,3 +149,65 @@ fn series_serializes_stats_flat_beside_the_start() {
     assert_eq!(json["p50"], 3);
     assert_eq!(json["count"], 1);
 }
+
+#[test]
+fn histogram_places_each_call_in_the_first_bucket_that_holds_it() {
+    let mut h = Histogram::default();
+    h.observe(0.004);
+    h.observe(0.01);
+    h.observe(4.0);
+    h.observe(100.0);
+
+    let cumulative = h.cumulative();
+    assert_eq!(cumulative.len(), TOOL_CALL_BUCKETS_SECS.len());
+    let at = |bound: f64| {
+        let i = TOOL_CALL_BUCKETS_SECS
+            .iter()
+            .position(|&b| b == bound)
+            .unwrap();
+        cumulative[i]
+    };
+    assert_eq!(at(0.01), 2);
+    assert_eq!(at(2.5), 2);
+    assert_eq!(at(5.0), 3);
+    assert_eq!(at(30.0), 3);
+    assert_eq!(h.count, 4);
+    assert!((h.sum - 104.014).abs() < 1e-9, "{}", h.sum);
+}
+
+#[test]
+fn totals_are_cumulative_and_fold_unknown_tools_into_other() {
+    let recorder = LatencyRecorder::default();
+    let now = Instant::now();
+    recorder.record_at(now, "search", ms(20), true);
+    recorder.record_at(now, "search", ms(7_000), false);
+    recorder.record_at(now, "made_up_tool", ms(1), true);
+
+    let totals = recorder.totals();
+    assert_eq!(totals["search"].histogram.count, 2);
+    assert_eq!(totals["search"].failures, 1);
+    assert_eq!(totals["other"].histogram.count, 1);
+    assert!(!totals.contains_key("made_up_tool"));
+}
+
+#[test]
+fn totals_survive_sample_retention() {
+    let recorder = LatencyRecorder::default();
+    let start = Instant::now();
+    recorder.record_at(start, "find", ms(10), true);
+    recorder.record_at(
+        start + RETENTION + Duration::from_secs(1),
+        "find",
+        ms(10),
+        true,
+    );
+
+    assert_eq!(recorder.totals()["find"].histogram.count, 2);
+    assert_eq!(
+        recorder
+            .summary_at(start + RETENTION + Duration::from_secs(1), RETENTION)
+            .overall
+            .count,
+        1
+    );
+}

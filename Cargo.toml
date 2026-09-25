@@ -1,6 +1,6 @@
 [package]
 name = "codesearch"
-version = "1.5.2"
+version = "1.6.0"
 edition = "2021"
 authors = ["codesearch contributors"]
 license = "Apache-2.0"
@@ -123,6 +123,10 @@ criterion = { version = "0.5", features = ["html_reports"] }
 tempfile = "3.13"
 pretty_assertions = "1.4"
 serial_test = "3"
+
+[[bench]]
+name = "search_fanout"
+harness = false
 
 # Benchmarks will be added later
 # [[bench]]

@@ -207,6 +207,7 @@ TUI `i` overlay. The TUI discovery tick is config-only (zero HTTP).
 
 - **Never use the bundled `codesearch` binary to investigate this repo** (it is the project under development). Use codesearch MCP tools first for discovery (this repo is indexed as `codesearch-git`); `grep`/`Read` for exact refs, other git refs, or when MCP returns nothing.
 - **Tests live in sibling `_tests.rs` files**, table-driven preferred over near-duplicate per-case fns.
+- **Search perf:** `cargo bench --bench search_fanout` (synthetic stores via `bench_support`, never real `.codesearch.db`s) and `node scripts/bench-live.mjs` against a running serve. `mcp_fanout_tests` fails if multi-store fan-out goes sequential.
 - **Tests that set env vars must be `#[serial]`** and set them via `crate::testing::EnvRestore` — cargo runs tests as parallel threads of one process, so an unserialised `set_var` races every reader.
 - **Never call `.canonicalize()`** — use `safe_canonicalize()`.
 - **Windows transient rename errors** (os error 5/32/33 from AV/Search-Indexer races): classify with `is_transient_rename_error()` / `ServeState::is_db_locked_error` and wrap in a bounded retry. Never retry non-transient errors.

@@ -17,12 +17,13 @@ impl CodesearchService {
 
     /// Unified search tool — dispatches to semantic or literal search based on `mode`.
     #[tool(
-        description = "Unified code search. Set `mode` to choose the backend:\n\n- `semantic` (default): vector embeddings + BM25 FTS + exact-identifier boosting, fused with RRF. Best for conceptual queries, identifier lookups, and mixed natural-language + symbol queries.\n- `literal`: pure FTS, no embeddings. Fast and works without an embedding model. Sub-mode selection:\n  * Queries with operators, brackets, or punctuation (`foo = null`, `Vec<T>`, `return x;`, `a::b`) -> set `regex=true` and write the query as a regex. BM25 tokenizes on punctuation otherwise, producing noisy results.\n  * Multi-word exact phrases -> set `phrase=true`.\n  * Plain identifier lookups (`CodesearchService`) -> leave both false.\n\nFor semantic mode, optionally set `semantic_mode`: \"auto\" (default) | \"semantic\" | \"lexical\" | \"hybrid\".\nReturns metadata only by default (`compact=true`). Use `get_chunk` to read full code. Prefer `search(mode=\"literal\", regex=true)` over external grep/ripgrep for code patterns.\n\nIMPORTANT (multi-repo): always specify either `project` (single repo) or `group` (cross-repo). Omitting both in multi-repo mode returns a `scope_required` error with the list of available projects and groups. If the user has not indicated which repository to search, ask them to choose."
+        description = "Unified code search. Set `mode` to choose the backend:\n\n- `semantic` (default): vector embeddings + BM25 FTS + exact-identifier boosting, fused with RRF. Best for conceptual queries, identifier lookups, and mixed natural-language + symbol queries.\n- `literal`: pure FTS, no embeddings. Fast and works without an embedding model. Sub-mode selection:\n  * Queries with operators, brackets, or punctuation (`foo = null`, `Vec<T>`, `return x;`, `a::b`) -> set `regex=true` and write the query as a regex. BM25 tokenizes on punctuation otherwise, producing noisy results.\n  * Multi-word exact phrases -> set `phrase=true`.\n  * Plain identifier lookups (`CodesearchService`) -> leave both false.\n\nFor semantic mode, optionally set `semantic_mode`: \"auto\" (default) | \"semantic\" | \"lexical\" | \"hybrid\".\nReturns metadata only by default (`compact=true`). Use `get_chunk` to read full code. Prefer `search(mode=\"literal\", regex=true)` over external grep/ripgrep for code patterns.\n\nMulti-repo scope: set `project` (single repo) or `group` (cross-repo). Omitting both searches every registered repo (`group=\"all\"`); narrow with `project` or a named `group` when the user indicates which repositories matter."
     )]
     pub(crate) async fn search(
         &self,
         Parameters(request): Parameters<SearchRequest>,
     ) -> Result<CallToolResult, McpError> {
+        let request = self.with_default_search_scope(request);
         tracing::info!(
             "📥 search(query={:?}, mode={:?}, project={:?}, group={:?})",
             request.query,
@@ -99,6 +100,18 @@ impl CodesearchService {
                 mode
             ))])),
         }
+    }
+
+    /// Unscoped searches in multi-repo mode fan out to the virtual `all` group.
+    fn with_default_search_scope(&self, mut request: SearchRequest) -> SearchRequest {
+        let multi_repo = self
+            .serve_state
+            .as_ref()
+            .is_some_and(|state| state.config_snapshot().repos.len() > 1);
+        if multi_repo && request.project.is_none() && request.group.is_none() {
+            request.group = Some(crate::constants::ALL_GROUP_NAME.to_string());
+        }
+        request
     }
 
     // Internal implementations (called by consolidated tools above)

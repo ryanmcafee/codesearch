@@ -1,16 +1,17 @@
 #!/bin/sh
-# pre-push — three guards, run in order. Any one of them can block the push.
+# pre-push — two guards, run in order. Either one can block the push.
 #
 #   1. never push straight to master
-#   2. QC gate (mirrors CI) — skipped when the branch changes no Rust
-#   3. customer-reference leak scan
+#   2. customer-reference leak scan
+#
+# QC (fmt, clippy, tests) runs in CI only; running it here delayed every push.
 #
 # Installed via `git config core.hooksPath .githooks` — see .githooks/README.md.
 # There is deliberately no second copy of this file anywhere: the previous
 # setup kept a tracked template in scripts/ that had to be copied into
 # .git/hooks/ by hand, and the two drifted apart (the template was missing
-# guard 3 entirely, so following its own documented install instructions
-# silently removed the leak scan).
+# the leak scan entirely, so following its own documented install instructions
+# silently removed it).
 
 REPO="$(git rev-parse --show-toplevel)"
 
@@ -36,52 +37,7 @@ while read -r _local_ref _local_sha remote_ref _remote_sha; do
     esac
 done
 
-# --- 2. QC gate, only when Rust actually changed ----------------------------
-# Compared against origin/develop instead of the pushed ref range from stdin.
-# Two reasons: stdin is already consumed by guard 1 above, and "what does this
-# branch change relative to develop" answers the same question without the
-# all-zeros remote_sha edge case a brand-new branch produces.
-#
-# Every uncertain case runs the gate rather than skipping it: no origin/develop
-# to compare against, or a git failure, means we cannot prove Rust is untouched.
-#
-# "Touches Rust" is wider than *.rs and Cargo.*: qc.ps1 runs fmt, clippy and
-# tests, and a toolchain or cargo-config change flips any of those without a
-# single .rs file changing. rustfmt.toml and clippy.toml are not tracked today
-# but are listed so that adding one later cannot silently reopen this gap.
-RUST_PATHS='\.rs$|(^|/)Cargo\.(toml|lock)$|(^|/)rust-toolchain(\.toml)?$'
-RUST_PATHS="$RUST_PATHS"'|(^|/)(rustfmt|clippy)\.toml$|(^|/)\.cargo/|(^|/)scripts/qc\.'
-
-RUN_QC=1
-if git rev-parse --verify --quiet origin/develop >/dev/null; then
-    CHANGED=$(git diff --name-only origin/develop...HEAD)
-    if [ $? -eq 0 ] && ! printf '%s\n' "$CHANGED" | grep -qE "$RUST_PATHS"; then
-        RUN_QC=0
-    fi
-fi
-
-if [ "$RUN_QC" -eq 0 ]; then
-    echo ""
-    echo "QC gate skipped — this branch changes no Rust vs origin/develop."
-else
-    echo ""
-    echo "Running QC gate (mirrors CI)..."
-    echo ""
-    # git exports GIT_DIR (and friends) to hooks; tests that shell out to git
-    # would otherwise commit into, and reconfigure, this repository.
-    if ! env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_PREFIX -u GIT_COMMON_DIR \
-        pwsh -NoProfile -File "$REPO/scripts/qc.ps1" -Fast; then
-        echo ""
-        echo "QC gate FAILED. Push blocked."
-        echo "  Fix the errors above, or use 'git push --no-verify' to skip."
-        echo ""
-        exit 1
-    fi
-    echo ""
-    echo "QC gate passed."
-fi
-
-# --- 3. customer-reference leak scan ----------------------------------------
+# --- 2. customer-reference leak scan ----------------------------------------
 # The pattern list lives in an untracked file because the list *is* the thing
 # being hidden — committing it would leak exactly what it exists to catch.
 #

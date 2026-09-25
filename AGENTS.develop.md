@@ -83,14 +83,14 @@ Five tools exposed to agents:
 
 | Tool | Description |
 |---|---|
-| `search` | Hybrid semantic + BM25 search. Requires `project` or `group` in multi-repo mode. |
+| `search` | Hybrid semantic + BM25 search. Defaults to `group="all"` when unscoped in multi-repo mode. |
 | `find` | Symbol navigation: definition, usages, imports, dependents. Requires scope. |
 | `explore` | File outline or similar-chunk lookup. Requires scope. |
 | `get_chunk` | Retrieve a chunk by ID with optional context lines. Requires `project` in multi-repo mode. |
 | `status` | Index and project status. Lightweight (no DB open) when called without scope. `kind="health"\|"latency"\|"repos"\|"events"` return serve health (same builders as `/api/*`). |
 
-All tools return `scope_required` structured errors in multi-repo mode when no `project`
-or `group` is specified, with `available_projects`, `available_groups`, and `hint_for_agent`.
+All tools except `search` return `scope_required` structured errors in multi-repo mode when no
+`project` or `group` is specified, with `available_projects`, `available_groups`, and `hint_for_agent`.
 
 ## Multi-repo serve mode
 

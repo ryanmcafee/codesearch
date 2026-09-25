@@ -16,14 +16,16 @@ finalized in place with a date — no renaming/migration step needed.
 
 ## [1.6.0]
 
+### Added
+
+- **Prometheus `/metrics` endpoint on `codesearch serve`.** Text exposition format 0.0.4 with the same auth as `/status`: a cumulative tool-call duration histogram and failure counter per tool, windowed percentile gauges matching the dashboard, overall status, indexing governor jobs and inputs, QoS, per-repo index gauges, index event counters and process RSS/CPU. Labels are bounded (unknown tools fold into `tool="other"`, pause reasons into five categories, no error text).
+- **Search latency benchmarks.** `cargo bench --bench search_fanout` measures single-repo, group fan-out and cold-open search on synthetic stores; `scripts/bench-live.mjs` reports p50/p95/p99 and PASS/FAIL against the 5s p95 SLO for a running serve.
+
 ### Changed
 
 - **Multi-repo `search` and `find` read repos in parallel.** Multi-repo fan-out (vector, BM25 and exact-identifier reads) runs on a bounded read-priority pool, so latency tracks the slowest repo instead of the sum of all of them. Result order, per-repo dedup and failure warnings are unchanged.
 - **Cold group queries open repos concurrently.** The first fan-out after start-up or idle eviction opens up to 8 repos at a time instead of one by one, and the per-open index health check no longer queues behind indexing work.
-
-### Added
-
-- **Search latency benchmarks.** `cargo bench --bench search_fanout` measures single-repo, group fan-out and cold-open search on synthetic stores; `scripts/bench-live.mjs` reports p50/p95/p99 and PASS/FAIL against the 5s p95 SLO for a running serve.
+- **The health dashboard reads its numbers from `/metrics`.** Status, latency tiles, the per-tool table, governor, QoS and the repo table come from the Prometheus endpoint; the latency chart, event log, degraded reasons and index errors still use the JSON API, which is unchanged.
 
 ### Fixed
 

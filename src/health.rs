@@ -4,6 +4,7 @@
 
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -21,6 +22,18 @@ pub enum EventLevel {
     Info,
     Warn,
     Error,
+}
+
+impl EventLevel {
+    pub const ALL: [Self; 3] = [Self::Info, Self::Warn, Self::Error];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Info => "info",
+            Self::Warn => "warn",
+            Self::Error => "error",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -50,6 +63,7 @@ pub struct IndexOutcome {
 pub struct HealthLog {
     events: Mutex<VecDeque<Event>>,
     outcomes: Mutex<HashMap<String, IndexOutcome>>,
+    totals: [AtomicU64; EventLevel::ALL.len()],
 }
 
 fn millis(d: Duration) -> u64 {
@@ -68,6 +82,7 @@ impl HealthLog {
     }
 
     fn push(&self, event: Event) {
+        self.totals[event.level as usize].fetch_add(1, Ordering::Relaxed);
         let mut events = self.events.lock().unwrap_or_else(|e| e.into_inner());
         if events.len() >= MAX_EVENTS {
             events.pop_front();
@@ -110,6 +125,11 @@ impl HealthLog {
     pub fn recent(&self, limit: usize) -> Vec<Event> {
         let events = self.events.lock().unwrap_or_else(|e| e.into_inner());
         events.iter().rev().take(limit).cloned().collect()
+    }
+
+    /// Events logged per level since start, including ones the ring buffer dropped.
+    pub fn event_totals(&self) -> [(EventLevel, u64); EventLevel::ALL.len()] {
+        EventLevel::ALL.map(|level| (level, self.totals[level as usize].load(Ordering::Relaxed)))
     }
 
     pub fn outcomes(&self) -> HashMap<String, IndexOutcome> {

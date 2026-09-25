@@ -133,6 +133,7 @@ async fn dashboard_page_uses_every_api_route() {
     let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
     let html = String::from_utf8(bytes.to_vec()).unwrap();
     for route in [
+        crate::constants::METRICS_PATH,
         crate::constants::API_SUMMARY_PATH,
         crate::constants::API_LATENCY_PATH,
         crate::constants::API_REPOS_PATH,

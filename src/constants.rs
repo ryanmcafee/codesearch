@@ -437,6 +437,9 @@ pub const API_REPOS_PATH: &str = "/api/repos";
 /// Health API: recent index and governor events, `?limit=`.
 pub const API_EVENTS_PATH: &str = "/api/events";
 
+/// Prometheus scrape endpoint (text exposition format 0.0.4).
+pub const METRICS_PATH: &str = "/metrics";
+
 /// How long an open repo may remain idle (no queries) before it is evicted.
 /// Eviction closes the DB handles, stops the FSW, and releases memory.
 /// The repo is automatically re-opened on the next query.

@@ -14,7 +14,13 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
-## [1.5.1]
+## [1.5.2]
+
+### Changed
+
+- **`search` defaults to `group="all"`.** An unscoped `search` in multi-repo mode fans out to every registered repo instead of returning `scope_required`, so agents get results without a round-trip. `project=` and named `group=` still narrow the scope; other tools keep requiring one.
+
+## [1.5.1] - 2026-09-24
 
 ### Fixed
 

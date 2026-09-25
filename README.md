@@ -457,7 +457,7 @@ group="all"   # fans out to all repos, equivalent to listing every alias
 
 - It is **not stored** in `repos.json` and always reflects the current set of registered repos (register or remove a repo and `all` updates automatically).
 - It appears in `codesearch groups list` (marked `virtual`) and in the `scope_required` error's `available_groups`, so agents discover it without extra setup.
-- It is **not the default** — when no `project`/`group` is specified in multi-repo mode, codesearch still returns `scope_required` (safe-by-default). Use `group="all"` explicitly when you want to search everywhere.
+- It is the **default for `search`** — when no `project`/`group` is specified in multi-repo mode, `search` fans out to `group="all"`. Other tools still return `scope_required` when unscoped.
 - `codesearch groups add all` and `codesearch groups remove all` are **rejected** — the name is reserved.
 
 ### Git Worktree Auto-Index

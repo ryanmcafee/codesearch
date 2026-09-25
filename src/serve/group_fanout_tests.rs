@@ -224,3 +224,42 @@ async fn group_similar_keeps_neighbours_sharing_the_source_chunk_id() {
         "the source chunk itself must be excluded: {text}"
     );
 }
+
+#[tokio::test]
+async fn unscoped_search_defaults_to_the_all_group() {
+    let fx = group_fixture(
+        ("fn shared_alpha() {}", ChunkKind::Function),
+        ("fn shared_beta() {}", ChunkKind::Function),
+    )
+    .await;
+    let request = serde_json::from_value(json!({"query": "fn", "mode": "literal"})).unwrap();
+    let text = text_of(fx.service.search(Parameters(request)).await.unwrap());
+    assert!(
+        !text.contains("scope_required"),
+        "unscoped search must not require a scope: {text}"
+    );
+    assert!(
+        text.contains("repo-a") && text.contains("repo-b"),
+        "unscoped search must fan out to every repo: {text}"
+    );
+}
+
+#[tokio::test]
+async fn project_scoped_search_does_not_widen_to_all() {
+    let fx = group_fixture(
+        ("fn shared_alpha() {}", ChunkKind::Function),
+        ("fn shared_beta() {}", ChunkKind::Function),
+    )
+    .await;
+    let request = serde_json::from_value(json!({
+        "query": "fn",
+        "mode": "literal",
+        "project": "repo-b"
+    }))
+    .unwrap();
+    let text = text_of(fx.service.search(Parameters(request)).await.unwrap());
+    assert!(
+        text.contains("shared_beta") && !text.contains("shared_alpha"),
+        "project= must stay scoped to one repo: {text}"
+    );
+}

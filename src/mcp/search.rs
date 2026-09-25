@@ -646,6 +646,37 @@ impl CodesearchService {
             }
         }
 
+        self.semantic_search_multi_embedded(
+            request,
+            identifiers,
+            limit,
+            compact,
+            stores,
+            aliases,
+            alias_roots,
+            &embeddings_by_alias,
+            model_warnings,
+        )
+        .await
+    }
+
+    /// Fan-out half of [`Self::semantic_search_multi`], given each repo's query embedding.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn semantic_search_multi_embedded(
+        &self,
+        request: &SemanticSearchRequest,
+        identifiers: &[String],
+        limit: usize,
+        compact: bool,
+        stores: Vec<Arc<SharedStores>>,
+        aliases: &[String],
+        alias_roots: &std::collections::HashMap<String, String>,
+        embeddings_by_alias: &std::collections::HashMap<String, Vec<f32>>,
+        model_warnings: Vec<String>,
+    ) -> Result<CallToolResult, McpError> {
+        let mode = request.mode.as_deref().unwrap_or("auto");
+        let structural_intent = detect_structural_intent(&request.query);
+
         // Search vector stores across all repos, each with its own model's
         // query embedding.
         let outcome = self

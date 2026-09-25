@@ -1,4 +1,6 @@
 pub mod bench;
+#[doc(hidden)]
+pub mod bench_support;
 pub mod cache;
 pub mod chunker;
 pub mod cli;

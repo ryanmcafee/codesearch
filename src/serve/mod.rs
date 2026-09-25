@@ -389,7 +389,7 @@ impl RebuildDecision {
 }
 
 impl ServeState {
-    fn new(config: ReposConfig, config_path_override: Option<PathBuf>) -> Self {
+    pub(crate) fn new(config: ReposConfig, config_path_override: Option<PathBuf>) -> Self {
         let mut sys = sysinfo::System::new();
         sys.refresh_cpu_list(sysinfo::CpuRefreshKind::nothing());
         Self {

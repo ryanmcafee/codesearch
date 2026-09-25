@@ -1229,7 +1229,7 @@ impl CodesearchService {
     /// Encapsulates the common pattern: resolve multi-stores, extract single override
     /// vs multi-store vec, and determine if local DB check is needed.
     /// Also records the tool call for dashboard tracking when serve_state is active.
-    async fn resolve_routing(
+    pub(crate) async fn resolve_routing(
         &self,
         project: &Option<String>,
         group: &Option<String>,

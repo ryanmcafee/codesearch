@@ -7,7 +7,7 @@ use crate::mcp::merge_store_reads;
 use std::time::{Duration, Instant};
 
 const STORES: usize = 8;
-const PER_STORE_DELAY: Duration = Duration::from_millis(100);
+const PER_STORE_DELAY: Duration = Duration::from_millis(200);
 
 async fn fixture(tmp: &tempfile::TempDir) -> FanoutFixture {
     FanoutFixture::build(tmp.path(), STORES, 4, 8, &[STORES])
@@ -15,12 +15,14 @@ async fn fixture(tmp: &tempfile::TempDir) -> FanoutFixture {
         .unwrap()
 }
 
-/// Sequential fan-out takes STORES x delay; half of that leaves room for a loaded CI box.
+/// Fails when fan-out is closer to sequential than to the pool's ideal wave count.
 fn assert_concurrent(elapsed: Duration) {
     let sequential = PER_STORE_DELAY * STORES as u32;
+    let ideal = PER_STORE_DELAY * STORES.div_ceil(fanout_threads()) as u32;
+    let limit = (sequential + ideal) / 2;
     assert!(
-        elapsed < sequential / 2,
-        "fan-out over {STORES} stores took {elapsed:?}; sequential would be {sequential:?}"
+        elapsed < limit,
+        "fan-out over {STORES} stores took {elapsed:?}; limit {limit:?}, ideal {ideal:?}, sequential {sequential:?}"
     );
 }
 

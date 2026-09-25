@@ -312,7 +312,7 @@ async fn metrics_endpoint_serves_valid_exposition_with_every_family() {
     );
     assert!(find(
         "codesearch_tool_call_latency_seconds",
-        &[("tool", "all"), ("window", "1h"), ("quantile", "0.95")]
+        &[("tool", "all"), ("window", "1h"), ("percentile", "95")]
     )
     .is_some());
     assert!(find(
@@ -325,6 +325,10 @@ async fn metrics_endpoint_serves_valid_exposition_with_every_family() {
         &[("repo", "metrics-svc")]
     )
     .is_some_and(|s| s.value == "0.25"));
+    assert!(
+        samples.iter().all(|s| !s.labels.contains_key("quantile")),
+        "quantile is reserved for summaries"
+    );
     let statuses: f64 = samples
         .iter()
         .filter(|s| s.name == "codesearch_status")

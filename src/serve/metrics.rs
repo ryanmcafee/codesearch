@@ -16,7 +16,7 @@ use crate::telemetry::{self, Histogram, LatencyStats, TOOL_CALL_BUCKETS_SECS};
 
 pub(crate) const CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
-/// Windows of the quantile gauges, matching the dashboard tiles and chart ranges.
+/// Windows of the percentile gauges, matching the dashboard tiles and chart ranges.
 pub(crate) const WINDOWS: [(&str, Duration); 4] = [
     ("5m", Duration::from_secs(5 * 60)),
     ("1h", Duration::from_secs(60 * 60)),
@@ -202,21 +202,25 @@ fn write_tool_calls(m: &mut Exposition) -> LatencyStats {
     m.family(
         "codesearch_tool_call_latency_seconds",
         Kind::Gauge,
-        "Nearest-rank tool-call latency quantile over a trailing window; tool=\"all\" is every call.",
+        "Nearest-rank tool-call latency percentile over a trailing window; tool=\"all\" is every call.",
     );
     for (tool, window, stats) in &rows {
-        let quantiles = [
-            ("0.5", stats.p50),
-            ("0.95", stats.p95),
-            ("0.98", stats.p98),
-            ("0.99", stats.p99),
-            ("1", stats.p100),
+        let percentiles = [
+            ("50", stats.p50),
+            ("95", stats.p95),
+            ("98", stats.p98),
+            ("99", stats.p99),
+            ("100", stats.p100),
         ];
-        for (quantile, ms) in quantiles {
+        for (percentile, ms) in percentiles {
             if let Some(ms) = ms {
                 m.sample(
                     "codesearch_tool_call_latency_seconds",
-                    &[("tool", tool), ("window", window), ("quantile", quantile)],
+                    &[
+                        ("tool", tool),
+                        ("window", window),
+                        ("percentile", percentile),
+                    ],
                     secs(ms),
                 );
             }

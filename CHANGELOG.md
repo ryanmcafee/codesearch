@@ -14,6 +14,12 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.6.1] - 2026-09-25
+
+### Fixed
+
+- **`codesearch mcp` proxy works with MCP `2026-07-28` clients.** The proxy's hub connection negotiates an older protocol, so forwarded `tools/list` and `tools/call` results lost `resultType` and newer clients (Claude Code) rejected `tools/list` with "missing required resultType". The proxy now restores `resultType: "complete"`; clients on `2025-11-25` and older still get the old wire shape without it.
+
 ## [1.6.0] - 2026-09-25
 
 ### Added

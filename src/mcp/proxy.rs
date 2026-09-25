@@ -1,7 +1,7 @@
 use rmcp::{
     model::{
         CallToolRequestParams, CallToolResponse, Implementation, ListToolsResult,
-        PaginatedRequestParams, ServerCapabilities, ServerConfig,
+        PaginatedRequestParams, ResultType, ServerCapabilities, ServerConfig,
     },
     service::RequestContext,
     ErrorData as McpError, RoleClient, RoleServer, ServerHandler,
@@ -349,6 +349,12 @@ pub(crate) fn is_idle(
     now.saturating_duration_since(last_activity).as_secs() >= threshold_secs
 }
 
+/// The hub leg negotiates a pre-2026-07-28 protocol, so its results arrive without
+/// `resultType`; rmcp strips it again for legacy downstream peers.
+fn mark_complete_if_absent(result_type: &mut Option<ResultType>) {
+    result_type.get_or_insert(ResultType::COMPLETE);
+}
+
 impl ServerHandler for McpProxyService {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
@@ -372,8 +378,9 @@ impl ServerHandler for McpProxyService {
             let peer = self.peer.read().await.clone();
             match peer {
                 Some(p) => match p.list_tools(request.clone()).await {
-                    Ok(r) => {
+                    Ok(mut r) => {
                         self.mark_activity();
+                        mark_complete_if_absent(&mut r.result_type);
                         return Ok(r);
                     }
                     Err(e) => {
@@ -432,8 +439,9 @@ impl ServerHandler for McpProxyService {
             let peer = self.peer.read().await.clone();
             match peer {
                 Some(p) => match p.call_tool(request.clone()).await {
-                    Ok(r) => {
+                    Ok(mut r) => {
                         self.mark_activity();
+                        mark_complete_if_absent(&mut r.result_type);
                         return Ok(r.into());
                     }
                     Err(e) => {
@@ -486,6 +494,10 @@ impl ServerHandler for McpProxyService {
 #[cfg(test)]
 #[path = "proxy_idle_tests.rs"]
 mod proxy_idle_tests;
+
+#[cfg(test)]
+#[path = "proxy_result_type_tests.rs"]
+mod proxy_result_type_tests;
 
 /// Unit tests for `await_peer_bounded`'s refusal clamp and the
 /// `note_connect_failure` call site that fires it in production, isolated

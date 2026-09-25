@@ -2808,3 +2808,77 @@ fn single_index_status_requires_a_built_graph_to_report_ready() {
     let (status, _) = super::single_index_status(0, false);
     assert_eq!(status, "building");
 }
+
+// === group fan-out: hits are keyed by (store, chunk_id) ===
+//
+// Chunk ids restart at 0 in every store, so fusion and dedup over a group must
+// never treat equal ids from different repos as the same chunk.
+
+fn fts_hit(store_idx: usize, chunk_id: u32, score: f32) -> super::StoreHit<crate::fts::FtsResult> {
+    super::StoreHit {
+        store_idx,
+        hit: crate::fts::FtsResult { chunk_id, score },
+    }
+}
+
+fn vector_hit(store_idx: usize, id: u32) -> super::StoreHit<crate::vectordb::SearchResult> {
+    super::StoreHit {
+        store_idx,
+        hit: crate::vectordb::SearchResult {
+            id,
+            content: String::new(),
+            path: String::new(),
+            start_line: 1,
+            end_line: 1,
+            kind: String::new(),
+            signature: None,
+            docstring: None,
+            context: None,
+            hash: String::new(),
+            distance: 0.0,
+            score: 0.9,
+            context_prev: None,
+            context_next: None,
+        },
+    }
+}
+
+#[test]
+fn merge_exact_keeps_equal_chunk_ids_from_different_stores() {
+    let mut fts = vec![fts_hit(0, 0, 0.5)];
+    super::merge_exact_into_fts(&mut fts, vec![fts_hit(1, 0, 0.7), fts_hit(0, 0, 0.9)]);
+    let keys: Vec<_> = fts
+        .iter()
+        .map(|h| (super::HasHitKey::key(h), h.hit.score))
+        .collect();
+    assert_eq!(keys, vec![((0, 0), 0.9), ((1, 0), 0.7)]);
+}
+
+#[test]
+fn rrf_fuse_store_hits_never_merges_equal_ids_across_stores() {
+    let table: &[(&str, Option<Vec<super::StoreHit<crate::fts::FtsResult>>>)] = &[
+        ("without identifiers", None),
+        ("with identifiers", Some(vec![fts_hit(1, 0, 3.0)])),
+    ];
+    for (case, exact) in table {
+        let fused = super::rrf_fuse_store_hits(
+            &[vector_hit(0, 0)],
+            &[fts_hit(1, 0, 2.0)],
+            exact.as_deref(),
+            20.0,
+            20.0,
+        );
+        let mut keys: Vec<(usize, u32)> = fused.iter().map(|(k, _)| *k).collect();
+        keys.sort();
+        assert_eq!(keys, vec![(0, 0), (1, 0)], "{case}: {fused:?}");
+    }
+}
+
+#[test]
+fn rrf_fuse_store_hits_combines_signals_for_the_same_store_chunk() {
+    let fused =
+        super::rrf_fuse_store_hits(&[vector_hit(1, 0)], &[fts_hit(1, 0, 2.0)], None, 20.0, 20.0);
+    assert_eq!(fused.len(), 1, "{fused:?}");
+    assert_eq!(fused[0].0, (1, 0));
+    assert!((fused[0].1 - 2.0 / 21.0).abs() < 1e-6, "{fused:?}");
+}

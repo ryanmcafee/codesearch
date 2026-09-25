@@ -110,7 +110,7 @@ impl CodesearchService {
         // Stores that failed during this lookup. Without this, "the symbol may
         // not be indexed" below is emitted as a confident diagnosis even when
         // no store ever answered.
-        let mut find_warnings: Vec<String> = Vec::new();
+        let mut find_warnings: Vec<String> = ctx.skipped_warnings.clone();
 
         // FTS search — multi-store or single
         let fts_results = if let Some(ref sv) = ctx.stores_vec {
@@ -288,7 +288,7 @@ impl CodesearchService {
 
         // See `find_definition`: an empty result and a dead store must not
         // produce the same sentence.
-        let mut find_warnings: Vec<String> = Vec::new();
+        let mut find_warnings: Vec<String> = ctx.skipped_warnings.clone();
 
         // FTS search — multi-store or single
         let fts_results = if let Some(ref sv) = ctx.stores_vec {

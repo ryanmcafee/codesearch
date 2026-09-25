@@ -52,6 +52,8 @@ use std::sync::{Arc, Mutex};
 pub use types::*;
 
 mod explore;
+pub(crate) mod fanout;
+use fanout::open_fanout_stores;
 mod federation_helpers;
 mod find;
 mod find_impact;
@@ -229,6 +231,112 @@ fn merge_exact_into_fts<T: HasHitKey + HasScore>(fts_results: &mut Vec<T>, exact
             positions.insert(r.key(), fts_results.len());
             fts_results.push(r);
         }
+    }
+}
+
+/// Stores to query, their aliases (parallel), and warnings for registered repos that were skipped.
+type ResolvedStores = (Vec<Arc<SharedStores>>, Vec<String>, Vec<String>);
+
+/// Drop fan-out members whose registered root no longer exists, with one warning per skipped alias.
+///
+/// They stay registered (pruning is `codesearch index rm`'s job); opening and
+/// searching a deleted worktree only costs latency. Errors when nothing is left.
+fn split_missing_roots(
+    cfg: &crate::db_discovery::repos::ReposConfig,
+    aliases: Vec<String>,
+) -> std::result::Result<(Vec<String>, Vec<String>), String> {
+    let (live, missing): (Vec<String>, Vec<String>) = aliases
+        .into_iter()
+        .partition(|alias| cfg.resolve(alias).is_none_or(|root| root.exists()));
+    let warnings: Vec<String> = missing
+        .iter()
+        .map(|alias| {
+            let root = cfg
+                .resolve(alias)
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+            format!(
+                "repo '{alias}' skipped: its root {root} no longer exists \
+                 (still registered; remove it with `codesearch index rm {root}`)"
+            )
+        })
+        .collect();
+    if live.is_empty() && !warnings.is_empty() {
+        return Err(format!(
+            "No repo in scope can be searched:\n  - {}",
+            warnings.join("\n  - ")
+        ));
+    }
+    if !missing.is_empty() {
+        tracing::warn!(
+            "MCP: fan-out skipped repos with missing roots: {:?}",
+            missing
+        );
+    }
+    Ok((live, warnings))
+}
+
+fn alias_at(aliases: &[String], idx: usize) -> &str {
+    aliases.get(idx).map(|s| s.as_str()).unwrap_or("unknown")
+}
+
+/// Merge per-store fan-out reads (in store order) into one deduplicated, score-sorted outcome.
+///
+/// Hits are tagged with their store index and deduplicated by (store, chunk_id),
+/// keeping the higher score. The sort is stable, so equal scores keep store
+/// order and results never flap between runs. Failures are collected, never
+/// dropped: an empty result must not hide a failed store.
+pub(crate) fn merge_store_reads<R: HasChunkId + HasScore>(
+    per_store: Vec<anyhow::Result<Vec<R>>>,
+    aliases: &[String],
+    backend: &str,
+) -> MultiReadOutcome<StoreHit<R>> {
+    let mut failures: Vec<(String, String)> = Vec::new();
+    let mut all_results: Vec<StoreHit<R>> = Vec::new();
+    let mut seen_ids: std::collections::HashMap<(usize, u32), usize> =
+        std::collections::HashMap::new();
+
+    for (idx, read) in per_store.into_iter().enumerate() {
+        match read {
+            Ok(results) => {
+                for hit in results {
+                    let r = StoreHit {
+                        store_idx: idx,
+                        hit,
+                    };
+                    let key = r.key();
+                    if let Some(&existing_idx) = seen_ids.get(&key) {
+                        if r.score() > all_results[existing_idx].score() {
+                            all_results[existing_idx] = r;
+                        }
+                    } else {
+                        seen_ids.insert(key, all_results.len());
+                        all_results.push(r);
+                    }
+                }
+            }
+            Err(e) => {
+                let alias = alias_at(aliases, idx);
+                tracing::warn!(
+                    "{} store read failed for multi-store fan-out (alias {}): {:?}",
+                    backend,
+                    alias,
+                    e
+                );
+                failures.push((alias.to_string(), format!("{e:#}")));
+            }
+        }
+    }
+
+    all_results.sort_by(|a, b| {
+        b.score()
+            .partial_cmp(&a.score())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    MultiReadOutcome {
+        results: all_results,
+        failures,
     }
 }
 
@@ -1165,7 +1273,7 @@ impl CodesearchService {
         project: &Option<String>,
         group: &Option<String>,
         allow_unscoped: bool,
-    ) -> std::result::Result<Option<(Vec<Arc<SharedStores>>, Vec<String>)>, String> {
+    ) -> std::result::Result<Option<ResolvedStores>, String> {
         // No routing params → resolve based on repo count
         if project.is_none() && group.is_none() {
             if let Some(ref serve_state) = self.serve_state {
@@ -1176,11 +1284,9 @@ impl CodesearchService {
                     return Err(self.format_scope_error());
                 }
                 if !aliases.is_empty() {
-                    let mut all_stores = Vec::with_capacity(aliases.len());
-                    for alias in &aliases {
-                        all_stores.push(serve_state.get_or_open_stores(alias, false).await?);
-                    }
-                    return Ok(Some((all_stores, aliases)));
+                    let (aliases, skipped) = split_missing_roots(&cfg, aliases)?;
+                    let all_stores = open_fanout_stores(serve_state, &aliases).await?;
+                    return Ok(Some((all_stores, aliases, skipped)));
                 }
                 // No repos configured — fall through to local DB
             }
@@ -1206,7 +1312,7 @@ impl CodesearchService {
 
         if let Some(ref alias) = project {
             let stores = serve_state.get_or_open_stores(alias, true).await?;
-            return Ok(Some((vec![stores], vec![alias.clone()])));
+            return Ok(Some((vec![stores], vec![alias.clone()], Vec::new())));
         }
 
         if let Some(ref group_name) = group {
@@ -1214,11 +1320,9 @@ impl CodesearchService {
             if aliases.is_empty() {
                 return Err(format!("Group '{}' has no members.", group_name));
             }
-            let mut all_stores = Vec::with_capacity(aliases.len());
-            for alias in &aliases {
-                all_stores.push(serve_state.get_or_open_stores(alias, false).await?);
-            }
-            return Ok(Some((all_stores, aliases)));
+            let (aliases, skipped) = split_missing_roots(&serve_state.config_snapshot(), aliases)?;
+            let all_stores = open_fanout_stores(serve_state, &aliases).await?;
+            return Ok(Some((all_stores, aliases, skipped)));
         }
 
         Ok(None)
@@ -1229,7 +1333,7 @@ impl CodesearchService {
     /// Encapsulates the common pattern: resolve multi-stores, extract single override
     /// vs multi-store vec, and determine if local DB check is needed.
     /// Also records the tool call for dashboard tracking when serve_state is active.
-    async fn resolve_routing(
+    pub(crate) async fn resolve_routing(
         &self,
         project: &Option<String>,
         group: &Option<String>,
@@ -1241,14 +1345,14 @@ impl CodesearchService {
             .await?;
         let is_multi = resolved
             .as_ref()
-            .is_some_and(|(stores, _)| stores.len() > 1);
+            .is_some_and(|(stores, _, _)| stores.len() > 1);
         let (stores, stores_vec, store_aliases, project_alias) = match &resolved {
             None => (None, None, None, None),
-            Some((store_vec, aliases)) if store_vec.len() == 1 => {
+            Some((store_vec, aliases, _)) if store_vec.len() == 1 => {
                 let alias = aliases.first().cloned();
                 (Some(store_vec[0].clone()), None, None, alias)
             }
-            Some((store_vec, aliases)) => {
+            Some((store_vec, aliases, _)) => {
                 (None, Some(store_vec.clone()), Some(aliases.clone()), None)
             }
         };
@@ -1306,6 +1410,7 @@ impl CodesearchService {
             alias_roots,
             is_multi,
             needs_local_db,
+            skipped_warnings: resolved.map(|(_, _, skipped)| skipped).unwrap_or_default(),
         })
     }
 
@@ -1440,69 +1545,20 @@ impl CodesearchService {
     /// not blind a group query to the healthy ones — but it is reported back in
     /// [`MultiReadOutcome::failures`] so the caller can tell an genuinely empty
     /// result apart from a total failure.
-    async fn with_vector_store_read_multi<R, F>(
+    pub(crate) async fn with_vector_store_read_multi<R, F>(
         &self,
-        mut action: F,
+        action: F,
         stores: Vec<Arc<SharedStores>>,
         aliases: &[String],
     ) -> Result<MultiReadOutcome<StoreHit<R>>>
     where
-        F: FnMut(&str, &VectorStore) -> anyhow::Result<Vec<R>>,
-        R: Clone + HasChunkId + HasScore,
+        F: Fn(&str, &VectorStore) -> anyhow::Result<Vec<R>> + Sync,
+        R: Clone + HasChunkId + HasScore + Send,
     {
-        let mut failures: Vec<(String, String)> = Vec::new();
-        let mut all_results: Vec<StoreHit<R>> = Vec::new();
-        let mut seen_ids: std::collections::HashMap<(usize, u32), usize> =
-            std::collections::HashMap::new();
-
-        for (idx, store_arc) in stores.iter().enumerate() {
-            let alias = aliases.get(idx).map(|s| s.as_str()).unwrap_or("unknown");
-            let store = &store_arc.vector_store;
-            match action(alias, store) {
-                Ok(results) => {
-                    for hit in results {
-                        let r = StoreHit {
-                            store_idx: idx,
-                            hit,
-                        };
-                        let key = r.key();
-                        if let Some(&existing_idx) = seen_ids.get(&key) {
-                            // Keep the one with higher score
-                            if r.score() > all_results[existing_idx].score() {
-                                all_results[existing_idx] = r;
-                            }
-                        } else {
-                            seen_ids.insert(key, all_results.len());
-                            all_results.push(r);
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Vector store read failed for multi-store fan-out (alias {}): {:?}",
-                        alias,
-                        e
-                    );
-                    // Remembered, not just logged: a caller that only sees an
-                    // empty Vec cannot tell "nothing matched" from "every store
-                    // failed", and the second one must never be reported as a
-                    // successful empty search.
-                    failures.push((alias.to_string(), format!("{e:#}")));
-                }
-            }
-        }
-
-        // Sort by score descending
-        all_results.sort_by(|a, b| {
-            b.score()
-                .partial_cmp(&a.score())
-                .unwrap_or(std::cmp::Ordering::Equal)
+        let per_store = fanout::map_ordered(&stores, |idx, store_arc| {
+            action(alias_at(aliases, idx), &store_arc.vector_store)
         });
-
-        Ok(MultiReadOutcome {
-            results: all_results,
-            failures,
-        })
+        Ok(merge_store_reads(per_store, aliases, "Vector"))
     }
 
     /// Fan-out FTS store read across multiple stores, merging results.
@@ -1515,66 +1571,18 @@ impl CodesearchService {
     /// IS reported in [`MultiReadOutcome::failures`]. The literal path is not
     /// hypothetical here: during the cloud read-only incident every affected
     /// vendor returned 0 results for literal search too, and it looked clean.
-    async fn with_fts_store_read_multi<R, F>(
+    pub(crate) async fn with_fts_store_read_multi<R, F>(
         &self,
-        mut action: F,
+        action: F,
         stores: Vec<Arc<SharedStores>>,
         aliases: &[String],
     ) -> Result<MultiReadOutcome<StoreHit<R>>>
     where
-        F: FnMut(&FtsStore) -> Result<Vec<R>>,
-        R: Clone + HasChunkId + HasScore,
+        F: Fn(&FtsStore) -> Result<Vec<R>> + Sync,
+        R: Clone + HasChunkId + HasScore + Send,
     {
-        let mut failures: Vec<(String, String)> = Vec::new();
-        let mut all_results: Vec<StoreHit<R>> = Vec::new();
-        let mut seen_ids: std::collections::HashMap<(usize, u32), usize> =
-            std::collections::HashMap::new();
-
-        for (idx, store_arc) in stores.iter().enumerate() {
-            let alias = aliases.get(idx).map(|s| s.as_str()).unwrap_or("unknown");
-            let fts = &store_arc.fts_store;
-            match action(fts) {
-                Ok(results) => {
-                    for hit in results {
-                        let r = StoreHit {
-                            store_idx: idx,
-                            hit,
-                        };
-                        let key = r.key();
-                        if let Some(&existing_idx) = seen_ids.get(&key) {
-                            if r.score() > all_results[existing_idx].score() {
-                                all_results[existing_idx] = r;
-                            }
-                        } else {
-                            seen_ids.insert(key, all_results.len());
-                            all_results.push(r);
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "FTS store read failed for multi-store fan-out (alias {}): {:?}",
-                        alias,
-                        e
-                    );
-                    // Same contract as the vector fan-out: a swallowed failure
-                    // must not reach the caller as an ordinary empty result.
-                    failures.push((alias.to_string(), format!("{e:#}")));
-                }
-            }
-        }
-
-        // Sort by score descending
-        all_results.sort_by(|a, b| {
-            b.score()
-                .partial_cmp(&a.score())
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        Ok(MultiReadOutcome {
-            results: all_results,
-            failures,
-        })
+        let per_store = fanout::map_ordered(&stores, |_, store_arc| action(&store_arc.fts_store));
+        Ok(merge_store_reads(per_store, aliases, "FTS"))
     }
 
     // ─────────────────────────────────────────────────────────────────

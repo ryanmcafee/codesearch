@@ -50,7 +50,7 @@ impl CodesearchService {
 
         // Stores that failed during this lookup, so "no imports found" is never
         // reported as fact when a store never answered.
-        let mut import_warnings: Vec<String> = Vec::new();
+        let mut import_warnings: Vec<String> = ctx.skipped_warnings.clone();
 
         let mut items = if let Some(ref sv) = ctx.stores_vec {
             // Multi-store group fan-out: collect import items from all stores
@@ -260,7 +260,7 @@ impl CodesearchService {
 
         // Stores that failed during this lookup, so "no dependents" is never
         // reported as fact when a store never answered.
-        let mut dep_warnings: Vec<String> = Vec::new();
+        let mut dep_warnings: Vec<String> = ctx.skipped_warnings.clone();
 
         // Extract a meaningful search term from path-like inputs.
         // Import chunks contain module references like `use crate::constants::X`
@@ -484,7 +484,7 @@ impl CodesearchService {
         // Stores that failed while resolving the source embedding. `if let
         // Ok(Some(..))` used to discard the error, so a dead store produced
         // "embedding not found" — a wrong diagnosis, not a missing chunk.
-        let mut similar_warnings: Vec<String> = Vec::new();
+        let mut similar_warnings: Vec<String> = ctx.skipped_warnings.clone();
 
         let mut results = if let Some(ref sv) = ctx.stores_vec {
             // Multi-store: find the embedding in whichever store has it,

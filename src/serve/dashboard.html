@@ -155,7 +155,7 @@ code { font: 12px var(--mono); }
     </section>
   </div>
 
-  <footer>Served by <code>codesearch serve</code> from in-process telemetry; history resets when serve restarts. Refreshes every 15 seconds. JSON API: <code>/api/summary</code>, <code>/api/latency</code>, <code>/api/repos</code>, <code>/api/events</code>.</footer>
+  <footer>Served by <code>codesearch serve</code> from in-process telemetry; history resets when serve restarts. Refreshes every 15 seconds. Numbers come from the Prometheus endpoint <code>/metrics</code>; the latency chart, event log, degraded reasons and index errors from the JSON API: <code>/api/latency</code>, <code>/api/events</code>, <code>/api/summary</code>, <code>/api/repos</code>.</footer>
 </div>
 
 <script>
@@ -213,10 +213,103 @@ function el(tag, attrs = {}, ...children) {
   for (const c of children) node.append(c);
   return node;
 }
-async function getJson(route) {
+async function fetchOk(route) {
   const res = await fetch(route, { cache: 'no-store' });
   if (!res.ok) throw new Error(`${route} returned ${res.status}`);
-  return res.json();
+  return res;
+}
+async function getJson(route) {
+  return (await fetchOk(route)).json();
+}
+
+function parseValue(v) {
+  return v === '+Inf' ? Infinity : v === '-Inf' ? -Infinity : Number(v);
+}
+function parseMetrics(text) {
+  const samples = [];
+  for (const line of text.split('\n')) {
+    if (!line || line.startsWith('#')) continue;
+    const m = /^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{(.*)\})? (\S+)$/.exec(line);
+    if (!m) continue;
+    const labels = {};
+    for (const [, k, v] of (m[2] || '').matchAll(/([a-zA-Z_][a-zA-Z0-9_]*)="((?:[^"\\]|\\.)*)"/g)) {
+      labels[k] = v.replace(/\\(.)/g, (_, c) => (c === 'n' ? '\n' : c));
+    }
+    samples.push({ name: m[1], labels, value: parseValue(m[3]) });
+  }
+  const matches = (s, name, want) => s.name === name && Object.entries(want).every(([k, v]) => s.labels[k] === v);
+  return {
+    all: (name, want = {}) => samples.filter((s) => matches(s, name, want)),
+    value: (name, want = {}) => samples.find((s) => matches(s, name, want))?.value ?? null,
+  };
+}
+
+const PAUSE_TEXT = { read_latency: 'paused: slow tool call', memory_pressure: 'paused: memory pressure', cpu: 'paused: other processes busy', battery: 'paused: on battery', other: 'paused' };
+
+function windowStats(m, tool, window) {
+  const stats = { count: m.value('codesearch_tool_call_window_calls', { tool, window }) ?? 0, failures: m.value('codesearch_tool_call_window_failures', { tool, window }) ?? 0 };
+  for (const p of PERCENTILES) {
+    const secs = m.value('codesearch_tool_call_latency_seconds', { tool, window, percentile: p.slice(1) });
+    stats[p] = secs == null ? null : secs * 1000;
+  }
+  return stats;
+}
+
+function summaryFromMetrics(m) {
+  const tools = m.all('codesearch_tool_call_window_calls', { window: '1h' })
+    .filter((s) => s.labels.tool !== 'all' && s.value > 0)
+    .map((s) => s.labels.tool);
+  const jobs = (state) => m.all('codesearch_index_governor_job_seconds', { state })
+    .map((s) => ({ label: s.labels.repo, priority: s.labels.priority, secs: s.value }));
+  const paused = m.all('codesearch_index_governor_paused_jobs').find((s) => s.value > 0)?.labels.reason;
+  const cpu = m.value('codesearch_index_governor_other_cpu_ratio');
+  return {
+    status: m.all('codesearch_status').find((s) => s.value === 1)?.labels.status ?? 'unknown',
+    reasonCount: m.value('codesearch_degraded_reasons') ?? 0,
+    reasons: [],
+    version: m.all('codesearch_build_info')[0]?.labels.version ?? '?',
+    uptime_secs: m.value('codesearch_uptime_seconds'),
+    generated_at_ms: Date.now(),
+    slo_ms: (m.value('codesearch_slo_seconds') ?? 5) * 1000,
+    read_target_ms: (m.value('codesearch_read_target_seconds') ?? 1) * 1000,
+    latency_1h: { overall: windowStats(m, 'all', '1h'), by_tool: Object.fromEntries(tools.map((t) => [t, windowStats(m, t, '1h')])) },
+    latency_5m: { overall: windowStats(m, 'all', '5m') },
+    index_governor: {
+      running: jobs('running'),
+      waiting: jobs('waiting'),
+      paused: paused ? PAUSE_TEXT[paused] ?? 'paused' : null,
+      inputs: {
+        memory_pressure: m.all('codesearch_index_governor_memory_pressure').find((s) => s.value === 1)?.labels.level,
+        other_cpu_percent: cpu == null ? null : cpu * 100,
+      },
+    },
+    qos: { index: m.all('codesearch_qos_info')[0]?.labels.index ?? '?', index_threads: m.value('codesearch_index_threads') },
+    repos: {
+      total: m.value('codesearch_repos') ?? 0,
+      indexing: m.value('codesearch_repos_indexing') ?? 0,
+      failing: m.value('codesearch_repos_failing') ?? 0,
+      queued: m.value('codesearch_repos_queued') ?? 0,
+    },
+  };
+}
+
+function reposFromMetrics(m) {
+  const per = (name, repo) => m.value(name, { repo });
+  return m.all('codesearch_repo_info').map(({ labels: { repo, path, status } }) => {
+    const indexed = per('codesearch_repo_last_indexed_timestamp_seconds', repo);
+    const took = per('codesearch_repo_last_index_duration_seconds', repo);
+    return {
+      alias: repo,
+      path,
+      status,
+      queued: per('codesearch_repo_queued', repo) === 1,
+      changes: per('codesearch_repo_pending_changes', repo) ?? 0,
+      failures: per('codesearch_repo_index_consecutive_failures', repo) ?? 0,
+      indexed_at_ms: indexed == null ? null : indexed * 1000,
+      duration_ms: took == null ? null : took * 1000,
+      error: null,
+    };
+  });
 }
 
 function renderChips() {
@@ -244,19 +337,17 @@ function renderLatencyTile(s) {
 }
 
 function renderGovernor(g) {
-  const running = g.index_governor.running;
-  const waiting = g.index_governor.waiting;
-  const paused = running.find((j) => j.paused);
+  const { running, waiting, paused } = g.index_governor;
   const state = paused ? 'paused' : running.length ? 'indexing' : waiting.length ? 'waiting' : 'idle';
   $('gov').textContent = state;
   $('gov').className = `value ${paused ? 'warn' : ''}`;
   const current = running[0];
   const parts = [];
   if (current) parts.push(`${basename(current.label)} (${current.priority}, ${current.secs}s)`);
-  if (paused) parts.push(paused.paused);
+  if (paused) parts.push(paused);
   if (waiting.length) parts.push(`${waiting.length} waiting`);
   const inputs = g.index_governor.inputs;
-  if (inputs.memory_pressure && inputs.memory_pressure !== 'normal' && !paused?.paused.includes('memory')) parts.push(`memory ${inputs.memory_pressure}`);
+  if (inputs.memory_pressure && inputs.memory_pressure !== 'normal' && !paused?.includes('memory')) parts.push(`memory ${inputs.memory_pressure}`);
   if (inputs.other_cpu_percent != null) parts.push(`other CPU ${Math.round(inputs.other_cpu_percent)}%`);
   parts.push(`QoS ${g.qos.index} x${g.qos.index_threads}`);
   $('govnote').textContent = parts.join('. ');
@@ -387,12 +478,21 @@ async function refresh() {
   try {
     const hours = $('hours').value;
     const bucketMinutes = { 1: 2, 6: 10, 24: 30 }[hours];
-    const [summary, latency, repos, events] = await Promise.all([
-      getJson('/api/summary'),
+    const [metricsText, latency, events] = await Promise.all([
+      fetchOk('/metrics').then((res) => res.text()),
       getJson(`/api/latency?hours=${hours}&bucket_minutes=${bucketMinutes}`),
-      getJson('/api/repos'),
       getJson('/api/events?limit=60'),
     ]);
+    const metrics = parseMetrics(metricsText);
+    const summary = summaryFromMetrics(metrics);
+    const repos = reposFromMetrics(metrics);
+    const [detail, failing] = await Promise.all([
+      summary.reasonCount ? getJson('/api/summary') : null,
+      summary.repos.failing ? getJson('/api/repos?status=failing') : [],
+    ]);
+    if (detail) summary.reasons = detail.reasons;
+    const errors = new Map(failing.map((r) => [r.alias, r.error]));
+    for (const r of repos) r.error = errors.get(r.alias) ?? null;
     renderSummary(summary);
     renderChart(latency);
     repoRows = repos;

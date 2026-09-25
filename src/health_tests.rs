@@ -175,3 +175,22 @@ fn slo_reads_the_env_and_ignores_invalid_values() {
         assert_eq!(slo_ms(), want, "{value:?}");
     }
 }
+
+#[test]
+fn event_totals_count_every_level_past_the_ring_buffer() {
+    let log = HealthLog::default();
+    for _ in 0..MAX_EVENTS + 5 {
+        log.event(EventLevel::Info, "tick", None);
+    }
+    log.job_finished("/r", Duration::from_millis(1), Err("boom".to_string()));
+
+    assert_eq!(
+        log.event_totals(),
+        [
+            (EventLevel::Info, MAX_EVENTS as u64 + 5),
+            (EventLevel::Warn, 0),
+            (EventLevel::Error, 1),
+        ]
+    );
+    assert_eq!(EventLevel::Warn.as_str(), "warn");
+}

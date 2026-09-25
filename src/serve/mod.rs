@@ -11,6 +11,7 @@
 //! Lazy-opens stores on first query. Conflicted repos are isolated.
 
 pub(crate) mod dashboard;
+pub(crate) mod metrics;
 mod tui;
 mod tui_common;
 mod tui_remote;
@@ -41,9 +42,9 @@ use crate::constants::{
     CSHARP_SCIP_CONCURRENCY_DEFAULT, CSHARP_SCIP_CONCURRENCY_ENV, DASHBOARD_PATH, DB_DIR_NAME,
     DEFAULT_SERVE_PORT, DISABLE_HOST_VALIDATION_ENV, EXPLORE_PATH, FIND_IMPACT_PATH, FIND_PATH,
     HEALTHZ_PATH, HEALTH_PATH, INDEXING_PATH, LANG_CSHARP, LANG_TYPESCRIPT, MAX_INDEXING_SECS,
-    MAX_INDEXING_SECS_ENV, MCP_ENDPOINT_PATH, PERSIST_DEBOUNCE_SECS, REAPER_INTERVAL_SECS,
-    REMOTES_PATH, REPO_IDLE_TIMEOUT_ENV, REPO_IDLE_TIMEOUT_SECS, SEARCH_PATH, SERVE_API_KEY_ENV,
-    SERVE_PORT_ENV, STATUS_PATH,
+    MAX_INDEXING_SECS_ENV, MCP_ENDPOINT_PATH, METRICS_PATH, PERSIST_DEBOUNCE_SECS,
+    REAPER_INTERVAL_SECS, REMOTES_PATH, REPO_IDLE_TIMEOUT_ENV, REPO_IDLE_TIMEOUT_SECS, SEARCH_PATH,
+    SERVE_API_KEY_ENV, SERVE_PORT_ENV, STATUS_PATH,
 };
 use crate::db_discovery::repos::{config_dir, ReposConfig};
 use crate::index::{
@@ -389,7 +390,7 @@ impl RebuildDecision {
 }
 
 impl ServeState {
-    fn new(config: ReposConfig, config_path_override: Option<PathBuf>) -> Self {
+    pub(crate) fn new(config: ReposConfig, config_path_override: Option<PathBuf>) -> Self {
         let mut sys = sysinfo::System::new();
         sys.refresh_cpu_list(sysinfo::CpuRefreshKind::nothing());
         Self {
@@ -2609,34 +2610,34 @@ impl ServeState {
         // "Index not built" until the background refresh completes.
         // build_index() is CPU-heavy — offload to the blocking pool so the async
         // runtime is not stalled while building the HNSW index for large repos.
-        {
-            let vector_store = Arc::clone(&stores.vector_store);
-            let alias_owned = alias.to_string();
-            match crate::index::executor::spawn_index_blocking(move || {
-                let vstore = &vector_store;
-                // `index_health()`, not `stats()` — the predicate needs exactly
-                // `(total_chunks, indexed)`, while `stats()` deserializes every
-                // ChunkMetadata in the store just to count unique file paths.
-                // Same two values from the same source, on a memory-sensitive path.
-                match vstore.index_health() {
-                    Ok((total_chunks, false)) if total_chunks > 0 => {
-                        info!(
-                            "Building vector index for '{}' ({} existing chunks)",
-                            alias_owned, total_chunks
-                        );
-                        if let Err(e) = vstore.build_index() {
-                            warn!("Failed to build vector index for '{}': {}", alias_owned, e);
-                        }
+        // The health probe is one LMDB count, so it runs inline: queueing it on
+        // the index pool made every cold open wait behind in-flight embedding.
+        //
+        // `index_health()`, not `stats()` — the predicate needs exactly
+        // `(total_chunks, indexed)`, while `stats()` deserializes every
+        // ChunkMetadata in the store just to count unique file paths.
+        // Same two values from the same source, on a memory-sensitive path.
+        match stores.vector_store.index_health() {
+            Ok((total_chunks, false)) if total_chunks > 0 => {
+                let vector_store = Arc::clone(&stores.vector_store);
+                let alias_owned = alias.to_string();
+                match crate::index::executor::spawn_index_blocking(move || {
+                    info!(
+                        "Building vector index for '{}' ({} existing chunks)",
+                        alias_owned, total_chunks
+                    );
+                    if let Err(e) = vector_store.build_index() {
+                        warn!("Failed to build vector index for '{}': {}", alias_owned, e);
                     }
-                    Ok(_) => {} // already indexed or no chunks
-                    Err(e) => warn!("Could not read index health for '{}': {}", alias_owned, e),
+                })
+                .await
+                {
+                    Ok(()) => {}
+                    Err(e) => warn!("warmup: build_index task panicked for '{}': {:?}", alias, e),
                 }
-            })
-            .await
-            {
-                Ok(()) => {}
-                Err(e) => warn!("warmup: build_index task panicked for '{}': {:?}", alias, e),
             }
+            Ok(_) => {} // already indexed or no chunks
+            Err(e) => warn!("Could not read index health for '{}': {}", alias, e),
         }
 
         let stores_arc = stores;
@@ -5722,6 +5723,7 @@ pub async fn run_serve(
             API_EVENTS_PATH,
             axum::routing::get(dashboard::events_handler),
         )
+        .route(METRICS_PATH, axum::routing::get(metrics::metrics_handler))
         .route("/repos", axum::routing::post(add_repo_handler))
         .route("/repos/{alias}", axum::routing::delete(remove_repo_handler))
         .route("/reload", axum::routing::post(reload_handler))
@@ -5775,6 +5777,7 @@ pub async fn run_serve(
     info!("   Health: http://{}{}", addr, HEALTH_PATH);
     info!("   MCP:    http://{}{}", addr, MCP_ENDPOINT_PATH);
     info!("   Health dashboard: http://{}{}", addr, DASHBOARD_PATH);
+    info!("   Prometheus metrics: http://{}{}", addr, METRICS_PATH);
 
     // ── Start TUI (if TTY available) ──
     // When a real terminal is attached, launch the fullscreen ratatui TUI.

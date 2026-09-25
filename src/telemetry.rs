@@ -17,6 +17,21 @@ const PERCENTILES: [u8; 5] = [50, 95, 98, 99, 100];
 /// (SCIP analysis, up to its budget) and `status` are recorded but not gated.
 pub const INTERACTIVE_TOOLS: [&str; 4] = ["search", "find", "explore", "get_chunk"];
 
+/// Tools with their own cumulative totals; any other name is counted as `other`.
+pub const KNOWN_TOOLS: [&str; 6] = [
+    "search",
+    "find",
+    "explore",
+    "get_chunk",
+    "status",
+    "find_impact",
+];
+
+/// Upper bounds (seconds) of the tool-call duration histogram, spanning the 5s SLO.
+pub const TOOL_CALL_BUCKETS_SECS: [f64; 12] = [
+    0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 20.0, 30.0,
+];
+
 #[derive(Debug, Clone)]
 struct Sample {
     at: Instant,
@@ -83,13 +98,63 @@ pub fn unix_ms_now() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
+/// Fixed-bucket duration histogram over [`TOOL_CALL_BUCKETS_SECS`]; calls above the last bound count only in `count`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Histogram {
+    buckets: [u64; TOOL_CALL_BUCKETS_SECS.len()],
+    pub sum: f64,
+    pub count: u64,
+}
+
+impl Histogram {
+    pub fn observe(&mut self, secs: f64) {
+        if let Some(i) = TOOL_CALL_BUCKETS_SECS
+            .iter()
+            .position(|&bound| secs <= bound)
+        {
+            self.buckets[i] += 1;
+        }
+        self.sum += secs;
+        self.count += 1;
+    }
+
+    /// Calls at or below each bound of [`TOOL_CALL_BUCKETS_SECS`].
+    pub fn cumulative(&self) -> Vec<u64> {
+        self.buckets
+            .iter()
+            .scan(0, |total, &n| {
+                *total += n;
+                Some(*total)
+            })
+            .collect()
+    }
+}
+
+/// Every call to one tool since the process started.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ToolTotals {
+    pub histogram: Histogram,
+    pub failures: u64,
+}
+
 #[derive(Default)]
 pub struct LatencyRecorder {
     samples: Mutex<VecDeque<Sample>>,
+    totals: Mutex<BTreeMap<&'static str, ToolTotals>>,
 }
 
 impl LatencyRecorder {
     pub fn record_at(&self, at: Instant, tool: &str, elapsed: Duration, ok: bool) {
+        {
+            let key = KNOWN_TOOLS
+                .into_iter()
+                .find(|&known| known == tool)
+                .unwrap_or("other");
+            let mut totals = self.totals.lock().unwrap_or_else(|e| e.into_inner());
+            let entry = totals.entry(key).or_default();
+            entry.histogram.observe(elapsed.as_secs_f64());
+            entry.failures += u64::from(!ok);
+        }
         let mut samples = self.samples.lock().unwrap_or_else(|e| e.into_inner());
         while samples
             .front()
@@ -124,6 +189,14 @@ impl LatencyRecorder {
                 .map(|(tool, s)| (tool.to_string(), LatencyStats::from_samples(s.into_iter())))
                 .collect(),
         }
+    }
+
+    /// Cumulative per-tool totals since start, keyed by a [`KNOWN_TOOLS`] name or `other`.
+    pub fn totals(&self) -> BTreeMap<&'static str, ToolTotals> {
+        self.totals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// `window` split into `bucket`-wide slices ending at `now`, oldest first.

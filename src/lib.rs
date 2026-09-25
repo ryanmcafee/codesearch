@@ -1,4 +1,6 @@
 pub mod bench;
+#[doc(hidden)]
+pub mod bench_support;
 pub mod cache;
 pub mod chunker;
 pub mod cli;
@@ -37,3 +39,7 @@ pub use utils::{
     group_chunks_by_path, group_chunks_by_path_with_capacity, group_embedded_chunks_by_path,
 };
 pub use vectordb::{SearchResult, StoreStats, VectorStore};
+
+#[cfg(test)]
+#[path = "mcp/fanout_tests.rs"]
+mod mcp_fanout_tests;

@@ -24,12 +24,34 @@ pub enum IndexPriority {
     Explicit,
 }
 
+impl IndexPriority {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Background => "background",
+            Self::Watcher => "watcher",
+            Self::Explicit => "explicit",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryPressure {
     Normal,
     Warn,
     Critical,
+}
+
+impl MemoryPressure {
+    pub const ALL: [Self; 3] = [Self::Normal, Self::Warn, Self::Critical];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Warn => "warn",
+            Self::Critical => "critical",
+        }
+    }
 }
 
 /// System and read-path signals sampled for a gate decision.

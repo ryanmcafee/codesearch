@@ -11,6 +11,7 @@
 //! Lazy-opens stores on first query. Conflicted repos are isolated.
 
 pub(crate) mod dashboard;
+pub(crate) mod metrics;
 mod tui;
 mod tui_common;
 mod tui_remote;
@@ -41,9 +42,9 @@ use crate::constants::{
     CSHARP_SCIP_CONCURRENCY_DEFAULT, CSHARP_SCIP_CONCURRENCY_ENV, DASHBOARD_PATH, DB_DIR_NAME,
     DEFAULT_SERVE_PORT, DISABLE_HOST_VALIDATION_ENV, EXPLORE_PATH, FIND_IMPACT_PATH, FIND_PATH,
     HEALTHZ_PATH, HEALTH_PATH, INDEXING_PATH, LANG_CSHARP, LANG_TYPESCRIPT, MAX_INDEXING_SECS,
-    MAX_INDEXING_SECS_ENV, MCP_ENDPOINT_PATH, PERSIST_DEBOUNCE_SECS, REAPER_INTERVAL_SECS,
-    REMOTES_PATH, REPO_IDLE_TIMEOUT_ENV, REPO_IDLE_TIMEOUT_SECS, SEARCH_PATH, SERVE_API_KEY_ENV,
-    SERVE_PORT_ENV, STATUS_PATH,
+    MAX_INDEXING_SECS_ENV, MCP_ENDPOINT_PATH, METRICS_PATH, PERSIST_DEBOUNCE_SECS,
+    REAPER_INTERVAL_SECS, REMOTES_PATH, REPO_IDLE_TIMEOUT_ENV, REPO_IDLE_TIMEOUT_SECS, SEARCH_PATH,
+    SERVE_API_KEY_ENV, SERVE_PORT_ENV, STATUS_PATH,
 };
 use crate::db_discovery::repos::{config_dir, ReposConfig};
 use crate::index::{
@@ -5722,6 +5723,7 @@ pub async fn run_serve(
             API_EVENTS_PATH,
             axum::routing::get(dashboard::events_handler),
         )
+        .route(METRICS_PATH, axum::routing::get(metrics::metrics_handler))
         .route("/repos", axum::routing::post(add_repo_handler))
         .route("/repos/{alias}", axum::routing::delete(remove_repo_handler))
         .route("/reload", axum::routing::post(reload_handler))
@@ -5775,6 +5777,7 @@ pub async fn run_serve(
     info!("   Health: http://{}{}", addr, HEALTH_PATH);
     info!("   MCP:    http://{}{}", addr, MCP_ENDPOINT_PATH);
     info!("   Health dashboard: http://{}{}", addr, DASHBOARD_PATH);
+    info!("   Prometheus metrics: http://{}{}", addr, METRICS_PATH);
 
     // ── Start TUI (if TTY available) ──
     // When a real terminal is attached, launch the fullscreen ratatui TUI.

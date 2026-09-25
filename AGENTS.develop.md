@@ -248,6 +248,7 @@ Never `unwrap_or_default()` a store error on a search path — "no results" and 
 
 ## Changelog highlights (recent)
 
+- **v1.5.1** -- group fan-out resolves and fuses hits by (store, chunk id): per-repo chunk ids collide, so group search/find/similar used to return chunks from the wrong repo
 - **v1.5.0** — read path isolated from indexing: lock-free snapshot reads with atomic `replace_chunks` publishes, a background-QoS indexing pool, an in-process indexing governor that yields to slow tool calls, tool-call p50..p100 in `/status` / `status(kind="health")`, and watcher ignore parity with the full walk; health dashboard at `/dashboard` with `/api/{summary,latency,repos,events}` and matching `status` kinds
 - **v1.4.4** — resident C# workspace pool no longer serves stale `find_impact` results after a rebuild: `WorkspacePool::evict` bumps a per-solution generation counter closing a spawn-in-flight race, and `scip_ref_cache` is now cleared unconditionally on both full and incremental rebuilds
 - **v1.3.37** — per-index embedding models end-to-end: serve queries, `POST /repos` and CLI index/stats/status honour the model each index records in its `metadata.json`; `serve --model` sets the default for newly created indexes; unrecorded indexes are queried with the built-in model plus a caller-facing warning; mid-rebuild indexes no longer report ready (PR #248)

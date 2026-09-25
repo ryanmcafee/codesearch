@@ -14,6 +14,12 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.5.1]
+
+### Fixed
+
+- **Group queries return chunks from the repo that matched.** Chunk ids restart at 0 in every repo, and group fan-out resolved each hit by bare id against the first repo holding it, so `group=` literal/lexical/hybrid search, `find` (definition, usages, dependents, imports fallback) and `explore(kind="similar")` returned unrelated chunks from other repos and hid the real matches. Every hit now carries its originating store; RRF fusion and dedup key on (store, chunk id). Multi-store literal scan failures are reported in `warnings` instead of skipped.
+
 ## [1.5.0] - 2026-09-24
 
 ### Added

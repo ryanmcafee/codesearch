@@ -209,28 +209,135 @@ pub(crate) struct QueryModel {
 }
 
 // v1: supports prefix/suffix patterns with `*` and `**` only.
-/// Merge exact FTS results into the main result set, deduplicating by chunk_id
+/// Merge exact FTS results into the main result set, deduplicating by hit key
 /// and keeping the max score for duplicates.
 ///
 /// This is the pure logic extracted from `semantic_search_lexical` for testability.
-fn merge_exact_into_fts(
-    fts_results: &mut Vec<crate::fts::FtsResult>,
-    exact: Vec<crate::fts::FtsResult>,
-) {
-    let mut positions: std::collections::HashMap<u32, usize> = fts_results
+fn merge_exact_into_fts<T: HasHitKey + HasScore>(fts_results: &mut Vec<T>, exact: Vec<T>) {
+    let mut positions: std::collections::HashMap<T::Key, usize> = fts_results
         .iter()
         .enumerate()
-        .map(|(idx, r)| (r.chunk_id, idx))
+        .map(|(idx, r)| (r.key(), idx))
         .collect();
 
     for r in exact {
-        if let Some(&existing_idx) = positions.get(&r.chunk_id) {
-            fts_results[existing_idx].score = fts_results[existing_idx].score.max(r.score);
+        if let Some(&existing_idx) = positions.get(&r.key()) {
+            if r.score() > fts_results[existing_idx].score() {
+                fts_results[existing_idx] = r;
+            }
         } else {
-            positions.insert(r.chunk_id, fts_results.len());
+            positions.insert(r.key(), fts_results.len());
             fts_results.push(r);
         }
     }
+}
+
+/// Look up a tagged hit's chunk in the store that produced it.
+///
+/// `Ok(None)` is a true miss; a store `Err` is noted in `warnings` so a broken
+/// repo never reads as an empty result.
+fn chunk_for_hit<R: HasChunkId>(
+    stores: &[Arc<SharedStores>],
+    aliases: &[String],
+    hit: &StoreHit<R>,
+    warnings: &mut Vec<String>,
+) -> Option<crate::vectordb::ChunkMetadata> {
+    chunk_for_key(stores, aliases, hit.key(), warnings)
+}
+
+fn chunk_for_key(
+    stores: &[Arc<SharedStores>],
+    aliases: &[String],
+    (store_idx, chunk_id): (usize, u32),
+    warnings: &mut Vec<String>,
+) -> Option<crate::vectordb::ChunkMetadata> {
+    let store = stores.get(store_idx)?;
+    let looked_up = store.vector_store.get_chunk(chunk_id);
+    match looked_up {
+        Ok(chunk) => chunk,
+        Err(ref e) => {
+            note_store_failure(warnings, aliases, store_idx, "chunk lookup", e);
+            None
+        }
+    }
+}
+
+fn search_result_from_chunk(
+    id: u32,
+    chunk: crate::vectordb::ChunkMetadata,
+    score: f32,
+) -> crate::vectordb::SearchResult {
+    crate::vectordb::SearchResult {
+        id,
+        content: chunk.content,
+        path: chunk.path,
+        start_line: chunk.start_line,
+        end_line: chunk.end_line,
+        kind: chunk.kind,
+        signature: chunk.signature,
+        docstring: chunk.docstring,
+        context: chunk.context,
+        hash: chunk.hash,
+        distance: 0.0,
+        score,
+        context_prev: chunk.context_prev,
+        context_next: chunk.context_next,
+    }
+}
+
+/// RRF-fuse group fan-out hits keyed by (store, chunk id), so equal ids from different repos never merge.
+///
+/// Keys are interned to per-query ids so the single-store fusion functions stay unchanged.
+/// `exact` is `None` when the query has no identifiers, matching the single-store path.
+fn rrf_fuse_store_hits(
+    vector: &[StoreHit<crate::vectordb::SearchResult>],
+    fts: &[StoreHit<crate::fts::FtsResult>],
+    exact: Option<&[StoreHit<crate::fts::FtsResult>]>,
+    vector_k: f32,
+    fts_k: f32,
+) -> Vec<((usize, u32), f32)> {
+    let mut keys: Vec<(usize, u32)> = Vec::new();
+    let mut ids: std::collections::HashMap<(usize, u32), u32> = std::collections::HashMap::new();
+    let mut local_id = |key: (usize, u32)| {
+        *ids.entry(key).or_insert_with(|| {
+            keys.push(key);
+            (keys.len() - 1) as u32
+        })
+    };
+    let vector_local: Vec<crate::vectordb::SearchResult> = vector
+        .iter()
+        .map(|h| crate::vectordb::SearchResult {
+            id: local_id(h.key()),
+            ..h.hit.clone()
+        })
+        .collect();
+    let mut fts_local = |hits: &[StoreHit<crate::fts::FtsResult>]| -> Vec<crate::fts::FtsResult> {
+        hits.iter()
+            .map(|h| crate::fts::FtsResult {
+                chunk_id: local_id(h.key()),
+                score: h.hit.score,
+            })
+            .collect()
+    };
+    let fts_hits = fts_local(fts);
+    let fused = match exact {
+        None => rrf_fusion(&vector_local, &fts_hits, vector_k),
+        Some(exact) => {
+            let exact_hits = fts_local(exact);
+            rrf_fusion_with_exact(
+                &vector_local,
+                &fts_hits,
+                &exact_hits,
+                vector_k,
+                fts_k,
+                EXACT_MATCH_RRF_K,
+            )
+        }
+    };
+    fused
+        .into_iter()
+        .map(|f| (keys[f.chunk_id as usize], f.rrf_score))
+        .collect()
 }
 
 /// Compute low-confidence signaling based on the top result's score.
@@ -1324,7 +1431,7 @@ impl CodesearchService {
     /// Fan-out vector store read across multiple stores, merging results.
     ///
     /// Runs `action(alias, store)` against each store and merges all results into
-    /// a single vec, deduplicating by (alias, chunk_id) (keeping highest score)
+    /// a single vec of [`StoreHit`]s, deduplicating by (store, chunk_id) (keeping highest score)
     /// and sorting by score descending. The `alias` is passed to the closure so
     /// callers can select per-repo state — notably the query embedding for that
     /// repo's own model (see `semantic_search_multi`).
@@ -1338,14 +1445,14 @@ impl CodesearchService {
         mut action: F,
         stores: Vec<Arc<SharedStores>>,
         aliases: &[String],
-    ) -> Result<MultiReadOutcome<R>>
+    ) -> Result<MultiReadOutcome<StoreHit<R>>>
     where
         F: FnMut(&str, &VectorStore) -> anyhow::Result<Vec<R>>,
         R: Clone + HasChunkId + HasScore,
     {
         let mut failures: Vec<(String, String)> = Vec::new();
-        let mut all_results: Vec<R> = Vec::new();
-        let mut seen_ids: std::collections::HashMap<(String, u32), usize> =
+        let mut all_results: Vec<StoreHit<R>> = Vec::new();
+        let mut seen_ids: std::collections::HashMap<(usize, u32), usize> =
             std::collections::HashMap::new();
 
         for (idx, store_arc) in stores.iter().enumerate() {
@@ -1353,8 +1460,12 @@ impl CodesearchService {
             let store = &store_arc.vector_store;
             match action(alias, store) {
                 Ok(results) => {
-                    for r in results {
-                        let key = (alias.to_string(), r.chunk_id());
+                    for hit in results {
+                        let r = StoreHit {
+                            store_idx: idx,
+                            hit,
+                        };
+                        let key = r.key();
                         if let Some(&existing_idx) = seen_ids.get(&key) {
                             // Keep the one with higher score
                             if r.score() > all_results[existing_idx].score() {
@@ -1396,8 +1507,9 @@ impl CodesearchService {
 
     /// Fan-out FTS store read across multiple stores, merging results.
     ///
-    /// Runs `action` against each store and merges all results into a single vec,
-    /// deduplicating by (alias, chunk_id) (keeping highest score) and sorting by score descending.
+    /// Runs `action` against each store and merges all results into a single vec of
+    /// [`StoreHit`]s, deduplicating by (store, chunk_id) (keeping highest score) and sorting by
+    /// score descending.
     ///
     /// Like the vector fan-out, a per-store failure does not abort the query but
     /// IS reported in [`MultiReadOutcome::failures`]. The literal path is not
@@ -1408,14 +1520,14 @@ impl CodesearchService {
         mut action: F,
         stores: Vec<Arc<SharedStores>>,
         aliases: &[String],
-    ) -> Result<MultiReadOutcome<R>>
+    ) -> Result<MultiReadOutcome<StoreHit<R>>>
     where
         F: FnMut(&FtsStore) -> Result<Vec<R>>,
         R: Clone + HasChunkId + HasScore,
     {
         let mut failures: Vec<(String, String)> = Vec::new();
-        let mut all_results: Vec<R> = Vec::new();
-        let mut seen_ids: std::collections::HashMap<(String, u32), usize> =
+        let mut all_results: Vec<StoreHit<R>> = Vec::new();
+        let mut seen_ids: std::collections::HashMap<(usize, u32), usize> =
             std::collections::HashMap::new();
 
         for (idx, store_arc) in stores.iter().enumerate() {
@@ -1423,8 +1535,12 @@ impl CodesearchService {
             let fts = &store_arc.fts_store;
             match action(fts) {
                 Ok(results) => {
-                    for r in results {
-                        let key = (alias.to_string(), r.chunk_id());
+                    for hit in results {
+                        let r = StoreHit {
+                            store_idx: idx,
+                            hit,
+                        };
+                        let key = r.key();
                         if let Some(&existing_idx) = seen_ids.get(&key) {
                             if r.score() > all_results[existing_idx].score() {
                                 all_results[existing_idx] = r;

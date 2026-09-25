@@ -56,7 +56,8 @@ impl CodesearchService {
             // Multi-store group fan-out: collect import items from all stores
             let import_aliases = ctx.aliases();
             let mut all_items: Vec<ImportItem> = Vec::new();
-            let mut seen_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
+            let mut seen_ids: std::collections::HashSet<(usize, u32)> =
+                std::collections::HashSet::new();
             for (store_idx, store_arc) in sv.iter().enumerate() {
                 let store = &store_arc.vector_store;
                 match store.chunks_for_file(&normalized) {
@@ -65,7 +66,7 @@ impl CodesearchService {
                             if !is_import_kind(&meta.kind) {
                                 continue;
                             }
-                            if seen_ids.insert(meta.id) {
+                            if seen_ids.insert((store_idx, meta.id)) {
                                 match store.get_chunk(meta.id) {
                                     Ok(Some(chunk)) => all_items.extend(parse_import_lines(
                                         &chunk.content,
@@ -129,11 +130,10 @@ impl CodesearchService {
             // Limitation: this only finds chunks containing these literal words;
             // language-specific import forms that lack these keywords will be missed.
             let fallback_limit = 40usize;
-            let mut all_hits: Vec<(u32, f32)> = Vec::new();
-            let mut seen_fts_ids: HashSet<u32> = HashSet::new();
-
             if let Some(ref sv) = ctx.stores_vec {
                 let import_aliases = ctx.aliases();
+                let mut all_hits: Vec<StoreHit<crate::fts::FtsResult>> = Vec::new();
+                let mut seen_fts_ids: HashSet<(usize, u32)> = HashSet::new();
                 // Multi-store FTS fallback
                 for keyword in IMPORT_FTS_KEYWORDS {
                     let hits = self
@@ -146,43 +146,26 @@ impl CodesearchService {
                         .unwrap_or_default()
                         .into_results(&mut import_warnings, "imports search");
                     for h in hits {
-                        if seen_fts_ids.insert(h.chunk_id) {
-                            all_hits.push((h.chunk_id, h.score));
+                        if seen_fts_ids.insert(h.key()) {
+                            all_hits.push(h);
                         }
                     }
                 }
 
-                // Resolve FTS hits via vector stores
                 let mut resolved: Vec<ImportItem> = Vec::new();
-                for (chunk_id, _) in &all_hits {
-                    for (store_idx, store_arc) in sv.iter().enumerate() {
-                        let store = &store_arc.vector_store;
-                        match store.get_chunk(*chunk_id) {
-                            Ok(Some(chunk)) => {
-                                if crate::cache::normalize_path_str(&chunk.path) == normalized {
-                                    resolved.extend(parse_import_lines(
-                                        &chunk.content,
-                                        chunk.start_line,
-                                    ));
-                                }
-                                break;
-                            }
-                            Ok(None) => continue,
-                            Err(ref e) => {
-                                note_store_failure(
-                                    &mut import_warnings,
-                                    import_aliases,
-                                    store_idx,
-                                    "chunk lookup",
-                                    e,
-                                );
-                                continue;
-                            }
+                for hit in &all_hits {
+                    if let Some(chunk) =
+                        chunk_for_hit(sv, import_aliases, hit, &mut import_warnings)
+                    {
+                        if crate::cache::normalize_path_str(&chunk.path) == normalized {
+                            resolved.extend(parse_import_lines(&chunk.content, chunk.start_line));
                         }
                     }
                 }
                 items = resolved;
             } else {
+                let mut all_hits: Vec<(u32, f32)> = Vec::new();
+                let mut seen_fts_ids: HashSet<u32> = HashSet::new();
                 // Single-store FTS fallback
                 for keyword in IMPORT_FTS_KEYWORDS {
                     let hits = match self
@@ -337,7 +320,7 @@ impl CodesearchService {
             // Single-store FTS search
             let alias = ctx.project_alias.as_deref().unwrap_or("unknown");
             let mut run = |r: anyhow::Result<Vec<crate::fts::FtsResult>>| match r {
-                Ok(hits) => hits,
+                Ok(hits) => single_store_hits(hits),
                 Err(e) => {
                     push_store_warning(
                         &mut dep_warnings,
@@ -370,59 +353,36 @@ impl CodesearchService {
             let dep_aliases = ctx.aliases();
             let mut seen_paths = HashSet::new();
             let mut out = Vec::new();
+            let term_lower = search_term.to_lowercase();
             for f in &fts_results {
-                for (store_idx, store_arc) in sv.iter().enumerate() {
-                    let store = &store_arc.vector_store;
-                    match store.get_chunk(f.chunk_id) {
-                        Ok(Some(chunk)) => {
-                            if !is_import_kind(&chunk.kind) {
-                                break; // try next FTS result
-                            }
-
-                            let norm = crate::cache::normalize_path_str(&chunk.path);
-                            if !seen_paths.insert(norm) {
-                                break;
-                            }
-
-                            let term_lower = search_term.to_lowercase();
-                            let import_statement =
-                                if chunk.content.to_lowercase().contains(&term_lower) {
-                                    chunk
-                                        .content
-                                        .lines()
-                                        .find(|l| l.to_lowercase().contains(&term_lower))
-                                        .unwrap_or("")
-                                        .to_string()
-                                } else {
-                                    chunk.signature.filter(|s| !s.is_empty()).unwrap_or(
-                                        chunk.content.lines().next().unwrap_or("").to_string(),
-                                    )
-                                };
-
-                            out.push(DependentItem {
-                                path: chunk.path,
-                                line: chunk.start_line,
-                                import_statement,
-                            });
-
-                            break; // found in this store, move to next FTS result
-                        }
-                        Ok(None) => {} // try next store
-                        // One broken store says nothing about the others; a
-                        // `break` here silently drops a chunk that lives in a
-                        // healthy store later in the list.
-                        Err(ref e) => {
-                            note_store_failure(
-                                &mut dep_warnings,
-                                dep_aliases,
-                                store_idx,
-                                "chunk lookup",
-                                e,
-                            );
-                            continue;
-                        }
-                    }
+                let Some(chunk) = chunk_for_hit(sv, dep_aliases, f, &mut dep_warnings) else {
+                    continue;
+                };
+                if !is_import_kind(&chunk.kind) {
+                    continue;
                 }
+                let norm = crate::cache::normalize_path_str(&chunk.path);
+                if !seen_paths.insert(norm) {
+                    continue;
+                }
+                let import_statement = if chunk.content.to_lowercase().contains(&term_lower) {
+                    chunk
+                        .content
+                        .lines()
+                        .find(|l| l.to_lowercase().contains(&term_lower))
+                        .unwrap_or("")
+                        .to_string()
+                } else {
+                    chunk
+                        .signature
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(chunk.content.lines().next().unwrap_or("").to_string())
+                };
+                out.push(DependentItem {
+                    path: chunk.path,
+                    line: chunk.start_line,
+                    import_statement,
+                });
                 if out.len() >= limit {
                     break;
                 }
@@ -436,7 +396,7 @@ impl CodesearchService {
                         let mut out = Vec::new();
                         let term_lower = search_term.to_lowercase();
                         for f in &fts_results {
-                            if let Some(chunk) = store.get_chunk(f.chunk_id)? {
+                            if let Some(chunk) = store.get_chunk(f.hit.chunk_id)? {
                                 if !is_import_kind(&chunk.kind) {
                                     continue;
                                 }
@@ -530,12 +490,12 @@ impl CodesearchService {
             // Multi-store: find the embedding in whichever store has it,
             // then search across all stores for similar chunks.
             let aliases = ctx.aliases();
-            let mut embedding: Option<Vec<f32>> = None;
+            let mut embedding: Option<(usize, Vec<f32>)> = None;
             for (i, store_arc) in sv.iter().enumerate() {
                 let store = &store_arc.vector_store;
                 match store.get_embedding(request.chunk_id) {
                     Ok(Some(emb)) => {
-                        embedding = Some(emb);
+                        embedding = Some((i, emb));
                         break;
                     }
                     Ok(None) => continue,
@@ -552,7 +512,7 @@ impl CodesearchService {
                 }
             }
 
-            let embedding = match embedding {
+            let (source_idx, embedding) = match embedding {
                 Some(e) => e,
                 None => {
                     return Ok(CallToolResult::success(vec![ContentBlock::text(
@@ -569,29 +529,28 @@ impl CodesearchService {
 
             // Search across all stores with the found embedding
             let mut all_results: Vec<SearchResultItem> = Vec::new();
-            let mut seen_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
             for (store_idx, store_arc) in sv.iter().enumerate() {
                 let store = &store_arc.vector_store;
                 match store.search(&embedding, limit + 1) {
                     Ok(mut neighbors) => {
-                        neighbors.retain(|r| r.id != request.chunk_id);
+                        if store_idx == source_idx {
+                            neighbors.retain(|r| r.id != request.chunk_id);
+                        }
                         for r in neighbors {
-                            if seen_ids.insert(r.id) {
-                                all_results.push(SearchResultItem {
-                                    chunk_id: Some(r.id),
-                                    path: r.path,
-                                    start_line: r.start_line,
-                                    end_line: r.end_line,
-                                    kind: r.kind,
-                                    score: r.score,
-                                    signature: r.signature,
-                                    content: None,
-                                    context_prev: None,
-                                    context_next: None,
-                                    source: None,
-                                    chunk_ref: None,
-                                });
-                            }
+                            all_results.push(SearchResultItem {
+                                chunk_id: Some(r.id),
+                                path: r.path,
+                                start_line: r.start_line,
+                                end_line: r.end_line,
+                                kind: r.kind,
+                                score: r.score,
+                                signature: r.signature,
+                                content: None,
+                                context_prev: None,
+                                context_next: None,
+                                source: None,
+                                chunk_ref: None,
+                            });
                         }
                     }
                     Err(ref e) => {

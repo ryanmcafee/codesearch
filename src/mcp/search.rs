@@ -540,8 +540,8 @@ impl CodesearchService {
             }
 
             all_fts.sort_by(|a, b| {
-                b.score
-                    .partial_cmp(&a.score)
+                b.score()
+                    .partial_cmp(&a.score())
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
 
@@ -702,18 +702,11 @@ impl CodesearchService {
 
         // === Mode: "semantic" — vector only ===
         if mode == "semantic" {
-            let fused = vector_only(&vector_results);
-            let chunk_to_result: std::collections::HashMap<u32, &crate::vectordb::SearchResult> =
-                vector_results.iter().map(|r| (r.id, r)).collect();
-
-            let mut results: Vec<crate::vectordb::SearchResult> = Vec::new();
-            for f in fused.into_iter().take(limit) {
-                if let Some(result) = chunk_to_result.get(&f.chunk_id) {
-                    let mut r = (*result).clone();
-                    r.score = f.rrf_score;
-                    results.push(r);
-                }
-            }
+            let results: Vec<crate::vectordb::SearchResult> = vector_results
+                .into_iter()
+                .take(limit)
+                .map(|r| r.hit)
+                .collect();
             return self.build_semantic_response(
                 results,
                 request,
@@ -752,7 +745,7 @@ impl CodesearchService {
 
         // Exact identifier search across all stores
         let all_exact = if !identifiers.is_empty() {
-            let mut exact_results: Vec<crate::fts::FtsResult> = Vec::new();
+            let mut exact_results: Vec<StoreHit<crate::fts::FtsResult>> = Vec::new();
             for ident in identifiers {
                 let exact_outcome = self
                     .with_fts_store_read_multi(
@@ -764,7 +757,7 @@ impl CodesearchService {
                     .unwrap_or_default();
                 search_warnings.extend(exact_outcome.warnings("exact-identifier search"));
                 for r in exact_outcome.results {
-                    if !exact_results.iter().any(|e| e.chunk_id == r.chunk_id) {
+                    if !exact_results.iter().any(|e| e.key() == r.key()) {
                         exact_results.push(r);
                     }
                 }
@@ -774,44 +767,28 @@ impl CodesearchService {
             Vec::new()
         };
 
-        // RRF fusion
-        let fused = if identifiers.is_empty() {
-            rrf_fusion(&vector_results, &fts_results, vector_k as f32)
-        } else {
-            rrf_fusion_with_exact(
-                &vector_results,
-                &fts_results,
-                &all_exact,
-                vector_k as f32,
-                fts_k as f32,
-                EXACT_MATCH_RRF_K,
-            )
-        };
+        let fused = rrf_fuse_store_hits(
+            &vector_results,
+            &fts_results,
+            (!identifiers.is_empty()).then_some(all_exact.as_slice()),
+            vector_k as f32,
+            fts_k as f32,
+        );
 
-        // Map FusedResult back to SearchResult via chunk lookup across all stores
-        let chunk_to_result: std::collections::HashMap<u32, &crate::vectordb::SearchResult> =
-            vector_results.iter().map(|r| (r.id, r)).collect();
+        let chunk_to_result: std::collections::HashMap<
+            (usize, u32),
+            &crate::vectordb::SearchResult,
+        > = vector_results.iter().map(|r| (r.key(), &r.hit)).collect();
 
         let mut mapped: Vec<crate::vectordb::SearchResult> = Vec::new();
-        for f in fused.into_iter().take(limit) {
-            if let Some(result) = chunk_to_result.get(&f.chunk_id) {
+        for (key, rrf_score) in fused.into_iter().take(limit) {
+            if let Some(result) = chunk_to_result.get(&key) {
                 let mut r = (*result).clone();
-                r.score = f.rrf_score;
+                r.score = rrf_score;
                 mapped.push(r);
-            } else {
-                // Chunk from FTS but not in vector results — resolve from stores
-                if let Some(resolved) = self
-                    .resolve_chunk_from_stores(
-                        f.chunk_id,
-                        f.rrf_score,
-                        &stores,
-                        aliases,
-                        &mut search_warnings,
-                    )
-                    .await
-                {
-                    mapped.push(resolved);
-                }
+            } else if let Some(chunk) = chunk_for_key(&stores, aliases, key, &mut search_warnings) {
+                // Chunk from FTS but not in vector results
+                mapped.push(search_result_from_chunk(key.1, chunk, rrf_score));
             }
         }
 
@@ -831,87 +808,23 @@ impl CodesearchService {
         )
     }
 
-    /// Resolve a single chunk from multiple stores (used for FTS-only hits in multi-store fusion).
-    async fn resolve_chunk_from_stores(
-        &self,
-        chunk_id: u32,
-        score: f32,
-        stores: &[Arc<SharedStores>],
-        aliases: &[String],
-        warnings: &mut Vec<String>,
-    ) -> Option<crate::vectordb::SearchResult> {
-        for (idx, store_arc) in stores.iter().enumerate() {
-            let store = &store_arc.vector_store;
-            let looked_up = store.get_chunk(chunk_id);
-            if let Err(ref e) = looked_up {
-                note_store_failure(warnings, aliases, idx, "chunk lookup", e);
-            }
-            if let Ok(Some(chunk)) = looked_up {
-                return Some(crate::vectordb::SearchResult {
-                    id: chunk_id,
-                    content: chunk.content,
-                    path: chunk.path,
-                    start_line: chunk.start_line,
-                    end_line: chunk.end_line,
-                    kind: chunk.kind,
-                    signature: chunk.signature,
-                    docstring: chunk.docstring,
-                    context: chunk.context,
-                    hash: chunk.hash,
-                    distance: 0.0,
-                    score,
-                    context_prev: chunk.context_prev,
-                    context_next: chunk.context_next,
-                });
-            }
-        }
-        None
-    }
-
-    /// Resolve FTS results to SearchResult using multiple stores.
+    /// Resolve tagged FTS hits to SearchResult, each in the store that produced it.
     async fn resolve_fts_to_search_results_multi(
         &self,
-        fts_results: &[crate::fts::FtsResult],
+        fts_results: &[StoreHit<crate::fts::FtsResult>],
         limit: usize,
         stores: &[Arc<SharedStores>],
         aliases: &[String],
         warnings: &mut Vec<String>,
     ) -> Vec<crate::vectordb::SearchResult> {
-        let mut results = Vec::new();
-        for fts in fts_results.iter().take(limit) {
-            for (idx, store_arc) in stores.iter().enumerate() {
-                let store = &store_arc.vector_store;
-                let looked_up = store.get_chunk(fts.chunk_id);
-                if let Err(ref e) = looked_up {
-                    // `Ok(None)` means "this store does not hold that chunk" and
-                    // is normal during fan-out; `Err` means the store is broken.
-                    // Collapsing the two is how a dead vector store renders as
-                    // an empty literal search — the exact shape of the step-8
-                    // incident, which tantivy-side checks cannot detect.
-                    note_store_failure(warnings, aliases, idx, "chunk lookup", e);
-                }
-                if let Ok(Some(chunk)) = looked_up {
-                    results.push(crate::vectordb::SearchResult {
-                        id: fts.chunk_id,
-                        content: chunk.content,
-                        path: chunk.path,
-                        start_line: chunk.start_line,
-                        end_line: chunk.end_line,
-                        kind: chunk.kind,
-                        signature: chunk.signature,
-                        docstring: chunk.docstring,
-                        context: chunk.context,
-                        hash: chunk.hash,
-                        distance: 0.0,
-                        score: fts.score,
-                        context_prev: chunk.context_prev,
-                        context_next: chunk.context_next,
-                    });
-                    break; // Found in this store, skip remaining stores
-                }
-            }
-        }
-        results
+        fts_results
+            .iter()
+            .take(limit)
+            .filter_map(|fts| {
+                chunk_for_hit(stores, aliases, fts, warnings)
+                    .map(|chunk| search_result_from_chunk(fts.hit.chunk_id, chunk, fts.hit.score))
+            })
+            .collect()
     }
 
     /// Lexical-only search: FTS without embedding service.

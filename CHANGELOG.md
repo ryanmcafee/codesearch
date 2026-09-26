@@ -14,6 +14,17 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.6.2]
+
+### Added
+
+- **Container image `ghcr.io/ryanmcafee/codesearch`.** Multi-arch (`linux/amd64`, `linux/arm64`, built natively per architecture) from `docker/Dockerfile`, published by the release workflow as `vX.Y.Z`, `X.Y.Z`, `X.Y` and `latest`. Non-root, embedding model baked in for offline starts, `codesearch` as entrypoint so `docker run -i IMAGE mcp /workspace` (stdio) and `docker run IMAGE serve ...` (HTTP) both work, and `SIGINT` as stop signal so `docker stop` shuts serve down cleanly. Guide: `docs/docker.md`, with a `docker/compose.yaml` example.
+- **Helm chart `charts/codesearch`.** Runs `codesearch serve` with persistent state and repo volumes, a generated (upgrade-stable) or existing API key Secret, `CODESEARCH_ALLOWED_HOSTS` derived from the Service and Ingress names, `CODESEARCH_ALLOWED_ROOTS` pinned to the repo volume, an optional `repo-sync` sidecar that clones, fetches and registers configured git repositories, and optional Ingress, ServiceMonitor and NetworkPolicy. Released with each version to `https://ryanmcafee.github.io/codesearch` and `oci://ghcr.io/ryanmcafee/charts/codesearch`. Guide: `docs/kubernetes.md`.
+
+### Fixed
+
+- **The Azure federation image builds again.** Since the `search_fanout` benchmark was declared in `Cargo.toml` (v1.6.0), the root `Dockerfile` failed at `cargo build` because `benches/` was not copied into the build context.
+
 ## [1.6.1] - 2026-09-25
 
 ### Fixed

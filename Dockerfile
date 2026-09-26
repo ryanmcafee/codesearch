@@ -30,6 +30,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Cache dependencies separately from source for faster rebuilds.
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY src ./src
+# Cargo.toml declares [[bench]] search_fanout; the manifest does not parse without it.
+COPY benches ./benches
 # Hook scripts are embedded at compile time via include_str! in
 # src/cli/claude_hooks.rs (path ../../integrations/claude-code/hooks/*). They
 # MUST be present in the build context or the release compile fails with

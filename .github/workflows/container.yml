@@ -1,0 +1,99 @@
+name: Container
+
+# Builds the general-purpose image (docker/Dockerfile) without pushing, smoke-tests
+# it and installs the Helm chart into kind with that image, so Dockerfile or
+# chart breakage shows up before release.yml publishes either. Path-filtered:
+# ordinary Rust PRs do not pay for the image build.
+
+on:
+  pull_request:
+    branches: [develop, master]
+    paths: &paths
+      - docker/**
+      - charts/**
+      - .dockerignore
+      - Cargo.toml
+      - Cargo.lock
+      - build.rs
+      - benches/**
+      - rust-toolchain.toml
+      - .github/ct.yaml
+      - .github/workflows/container.yml
+  push:
+    branches: [develop]
+    paths: *paths
+  workflow_dispatch:
+
+concurrency:
+  group: container-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  chart-lint:
+    runs-on: ubuntu-latest
+    steps:
+      # pin@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      # pin@v5.0.1
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310
+      # pin@v2.8.0
+      - uses: helm/chart-testing-action@6ec842c01de15ebb84c8627d2744a0c2f2755c9f
+      - name: ct lint
+        run: ct lint --config .github/ct.yaml --all
+      - name: helm template (values combinations)
+        run: charts/codesearch/ci/template-test.sh
+
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      # pin@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Resolve image tag from the chart appVersion
+        id: meta
+        run: |
+          app_version=$(sed -n 's/^appVersion: *"\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' charts/codesearch/Chart.yaml)
+          echo "image=ghcr.io/ryanmcafee/codesearch:${app_version}" >> "$GITHUB_OUTPUT"
+      # pin@v4.4.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
+      - name: Build image (linux/amd64, not pushed)
+        # pin@v7.4.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: ${{ steps.meta.outputs.image }}
+          build-args: |
+            VERSION=ci
+            REVISION=${{ github.sha }}
+          cache-from: type=gha,scope=codesearch-amd64
+          cache-to: type=gha,scope=codesearch-amd64,mode=max
+      - name: Smoke test (serve, healthz, metrics, MCP initialize)
+        run: docker/smoke-test.sh "${{ steps.meta.outputs.image }}"
+      - name: stdio MCP round trip
+        run: docker/stdio-test.sh "${{ steps.meta.outputs.image }}" "$PWD/charts"
+      # pin@v5.0.1
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310
+      # pin@v2.8.0
+      - uses: helm/chart-testing-action@6ec842c01de15ebb84c8627d2744a0c2f2755c9f
+      - name: Create kind cluster
+        # pin@v1.15.0
+        uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2
+        with:
+          cluster_name: codesearch-ci
+      - name: Load image into kind
+        run: kind load docker-image "${{ steps.meta.outputs.image }}" --name codesearch-ci
+      - name: ct install (helm test checks healthz, metrics and MCP initialize)
+        run: ct install --config .github/ct.yaml --all

@@ -1,0 +1,19 @@
+{{- if .Values.repositories }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "codesearch.fullname" . }}-repo-sync
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "codesearch.labels" . | nindent 4 }}
+data:
+  repo-sync.sh: |
+    {{- .Files.Get "files/repo-sync.sh" | nindent 4 }}
+  git-credential.sh: |
+    {{- .Files.Get "files/git-credential.sh" | nindent 4 }}
+  repositories: |
+    {{- range .Values.repositories }}
+    {{- $alias := .alias | default (base .url | trimSuffix ".git") }}
+    {{ $alias }}|{{ .url }}|{{ .branch | default "" }}|{{ .depth | default 1 }}
+    {{- end }}
+{{- end }}

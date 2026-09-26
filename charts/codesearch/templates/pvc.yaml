@@ -1,0 +1,30 @@
+{{- range $volume := list "data" "repos" }}
+{{- $p := index $.Values.persistence $volume }}
+{{- if and $p.enabled (not $p.existingClaim) }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "codesearch.fullname" $ }}-{{ $volume }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "codesearch.labels" $ | nindent 4 }}
+  {{- with $p.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  accessModes:
+    {{- toYaml $p.accessModes | nindent 4 }}
+  {{- if $p.storageClass }}
+  {{- if eq "-" $p.storageClass }}
+  storageClassName: ""
+  {{- else }}
+  storageClassName: {{ $p.storageClass | quote }}
+  {{- end }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ $p.size | quote }}
+{{- end }}
+{{- end }}

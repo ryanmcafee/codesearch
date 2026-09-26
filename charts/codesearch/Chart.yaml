@@ -1,0 +1,22 @@
+apiVersion: v2
+name: codesearch
+description: Semantic code search MCP server (codesearch serve) for coding agents
+type: application
+# Kept in lockstep with the codesearch release: release.yml sets version and
+# appVersion from the tag before packaging.
+version: 1.6.1
+appVersion: "1.6.1"
+kubeVersion: ">=1.25.0-0"
+home: https://github.com/ryanmcafee/codesearch
+sources:
+  - https://github.com/ryanmcafee/codesearch
+keywords:
+  - mcp
+  - code-search
+  - semantic-search
+  - embeddings
+maintainers:
+  - name: ryanmcafee
+    url: https://github.com/ryanmcafee
+annotations:
+  artifacthub.io/license: Apache-2.0

@@ -1,0 +1,14 @@
+image:
+  pullPolicy: Never
+repositories:
+  - url: https://github.com/octocat/Hello-World.git
+    depth: 1
+repoSync:
+  interval: 60
+persistence:
+  data:
+    size: 1Gi
+  repos:
+    size: 1Gi
+networkPolicy:
+  enabled: true

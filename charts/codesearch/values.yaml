@@ -1,0 +1,174 @@
+# Default values for the codesearch chart.
+
+nameOverride: ""
+fullnameOverride: ""
+commonLabels: {}
+
+image:
+  repository: ghcr.io/ryanmcafee/codesearch
+  # Defaults to the chart appVersion.
+  tag: ""
+  # Pins the image by digest (sha256:...); overrides tag.
+  digest: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+  automountServiceAccountToken: false
+
+# MCP sessions live in the serve process's memory and indexes are written by a
+# single process, so the chart always runs exactly one replica.
+
+auth:
+  # Existing Secret holding the API key; when empty the chart creates one and
+  # keeps its key stable across upgrades.
+  existingSecret: ""
+  existingSecretKey: api-key
+  # Explicit key for the chart-created Secret; random when empty.
+  apiKey: ""
+
+# Extra Host header values accepted by /mcp. The Service DNS names, loopback and
+# Ingress hosts are always included.
+allowedHosts: []
+# Extra roots (besides persistence.repos.mountPath) POST /repos may register.
+allowedRoots: []
+clusterDomain: cluster.local
+
+serve:
+  port: 39725
+  # Extra arguments appended to `codesearch serve --host 0.0.0.0 --no-tui`.
+  extraArgs: []
+
+extraEnv: []
+extraEnvFrom: []
+
+# Git repositories cloned into persistence.repos.mountPath, kept up to date and
+# registered with codesearch by the repo-sync sidecar.
+repositories: []
+  # - url: https://github.com/ryanmcafee/codesearch.git
+  #   # Defaults to the last URL path segment without .git.
+  #   alias: codesearch
+  #   # Defaults to the remote HEAD.
+  #   branch: develop
+  #   # Shallow clone depth; 0 clones full history.
+  #   depth: 1
+
+repoSync:
+  # Seconds between fetches.
+  interval: 300
+  git:
+    # Secret with a token for HTTPS clones of private repositories.
+    existingSecret: ""
+    tokenKey: token
+    username: x-access-token
+  resources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
+    limits:
+      memory: 256Mi
+
+persistence:
+  # $HOME/.codesearch: repos.json, embedding cache, logs, the embedding model.
+  data:
+    enabled: true
+    existingClaim: ""
+    storageClass: ""
+    accessModes: [ReadWriteOnce]
+    size: 5Gi
+    mountPath: /home/app/.codesearch
+    annotations: {}
+  # Repository checkouts; each repo's index lives in <repo>/.codesearch.db.
+  repos:
+    enabled: true
+    existingClaim: ""
+    storageClass: ""
+    accessModes: [ReadWriteOnce]
+    size: 20Gi
+    mountPath: /repos
+    annotations: {}
+
+service:
+  type: ClusterIP
+  port: 39725
+  annotations: {}
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts: []
+    # - host: codesearch.example.com
+    #   paths:
+    #     - path: /
+    #       pathType: Prefix
+  tls: []
+
+metrics:
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+    scrapeTimeout: 10s
+    labels: {}
+
+networkPolicy:
+  enabled: false
+  # Peers allowed to reach the serve port; empty allows every pod in the namespace.
+  from: []
+  # Egress rules; empty leaves egress unrestricted. DNS is always allowed when set.
+  egress: []
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  fsGroupChangePolicy: OnRootMismatch
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 1Gi
+  limits:
+    memory: 4Gi
+
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: http
+  periodSeconds: 20
+  timeoutSeconds: 5
+  failureThreshold: 3
+readinessProbe:
+  httpGet:
+    path: /healthz
+    port: http
+  periodSeconds: 10
+  timeoutSeconds: 5
+startupProbe:
+  httpGet:
+    path: /healthz
+    port: http
+  periodSeconds: 5
+  failureThreshold: 60
+
+terminationGracePeriodSeconds: 30
+priorityClassName: ""
+nodeSelector: {}
+tolerations: []
+affinity: {}

@@ -11,7 +11,7 @@ work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
 promtool() {
-  docker run --rm -v "$work:/work" -w /work --entrypoint promtool "$PROMETHEUS_IMAGE" "$@"
+  docker run --rm --user "$(id -u):$(id -g)" -v "$work:/work" -w /work --entrypoint promtool "$PROMETHEUS_IMAGE" "$@"
 }
 
 helm template codesearch "$chart" --namespace codesearch \

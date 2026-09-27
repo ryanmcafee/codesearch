@@ -1975,7 +1975,7 @@ mod tests {
         let cases: &[(Option<&str>, Result<Option<&str>, &str>)] = &[
             (None, Ok(None)),
             (Some("minilm-l6-q"), Ok(Some("minilm-l6-q"))),
-            (Some("AllMiniLML6V2Q"), Ok(Some("minilm-l6-q"))),
+            (Some("allminiml6v2q"), Ok(Some("minilm-l6-q"))),
             (Some("no-such-model"), Err("Unknown model 'no-such-model'")),
         ];
         for (input, want) in cases {

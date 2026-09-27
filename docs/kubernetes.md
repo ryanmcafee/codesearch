@@ -1,21 +1,16 @@
 # Running codesearch on Kubernetes
 
-The Helm chart in [`charts/codesearch`](../charts/codesearch) runs `codesearch serve` as a
-shared, authenticated MCP server for a team or a cluster of agents. Chart and image are released
-together: chart version `X.Y.Z` deploys image `ghcr.io/ryanmcafee/codesearch:X.Y.Z`.
+The Helm chart in [`charts/codesearch`](../charts/codesearch) runs `codesearch serve` as a shared MCP
+server for a team or for in-cluster agents. Chart and image are released together: chart version
+`X.Y.Z` deploys image `ghcr.io/ryanmcafee/codesearch:X.Y.Z`.
 
 ## Install
 
 ```bash
 helm repo add codesearch https://ryanmcafee.github.io/codesearch
 helm install codesearch codesearch/codesearch -n codesearch --create-namespace \
-  --set 'repositories[0].url=https://github.com/ryanmcafee/codesearch.git'
-```
-
-or from the OCI registry:
-
-```bash
-helm install codesearch oci://ghcr.io/ryanmcafee/charts/codesearch --version X.Y.Z -n codesearch --create-namespace
+  --set 'repositories.urls[0]=https://github.com/ryanmcafee/codesearch.git'
+# or: helm install codesearch oci://ghcr.io/ryanmcafee/charts/codesearch --version X.Y.Z ...
 ```
 
 ## Connect Claude Code
@@ -29,51 +24,104 @@ claude mcp add --transport http codesearch http://localhost:39725/mcp \
   --header "Authorization: Bearer $CODESEARCH_API_KEY"
 ```
 
-In-cluster agents use `http://codesearch.codesearch.svc.cluster.local:39725/mcp` with the same
-header. With `ingress.enabled`, use the Ingress host instead.
+In-cluster agents use `http://codesearch.codesearch.svc.cluster.local:39725/mcp`. With
+`ingress.enabled`, use the Ingress host.
 
 ## What the chart deploys
 
-- A **Deployment with one replica** (`Recreate`): MCP sessions live in the serve process's
-  memory and each index has a single writer, so the chart does not expose `replicaCount`.
-- Two **PersistentVolumeClaims**: `data` (`/home/app/.codesearch`: `repos.json`, embedding
-  cache, logs, the embedding model) and `repos` (`/repos`: checkouts, each holding its index in
-  `.codesearch.db`). An init container copies the baked-in embedding model into `data`, so the
-  pod starts without network access.
-- The **API key** Secret. The chart generates a random key once and reuses it on upgrade, or
-  reads `auth.existingSecret`. Every route except `/healthz` requires it; probes use `/healthz`.
-- `CODESEARCH_ALLOWED_HOSTS` set to the Service's short, namespaced and FQDN names, loopback
-  (for `kubectl port-forward`), the Ingress hosts and `allowedHosts`.
-- `CODESEARCH_ALLOWED_ROOTS` set to `/repos` plus `allowedRoots`, so `POST /repos` cannot
-  register paths elsewhere in the container.
+- A **Deployment with one replica** (`strategy.type: Recreate`): MCP sessions live in the serve
+  process's memory and each index has a single writer, so there is no replica count.
+- One **PersistentVolumeClaim** `<release>-data` (volume `data`, mounted at `/data`; `HOME` is
+  `/data/home`): `/data/home/.codesearch` holds `repos.json`, the embedding cache, logs and the
+  embedding model (copied from the image by the `seed-model` init container, so the pod starts
+  offline); `/data/repos` holds checkouts, each with its index in `.codesearch.db`.
+- `CODESEARCH_ALLOWED_HOSTS` set to the Service's short, namespaced and FQDN names, loopback (for
+  `kubectl port-forward`), the Ingress hosts and `allowedHosts`; `CODESEARCH_ALLOWED_ROOTS` set to
+  `/data/repos` plus `allowedRoots`.
+- Probes on the unauthenticated `/healthz`, a read-only root filesystem and a non-root user.
+
+## Authentication modes
+
+| `auth.mode` | How it works | Use when |
+|-------------|--------------|----------|
+| `apiKey` (default) | serve listens on the pod IP; every route except `/healthz` needs `Authorization: Bearer <key>`. The key comes from `auth.existingSecret` or a generated Secret that is kept across upgrades. | Clients can send a header, or traffic crosses an Ingress |
+| `networkPolicy` | serve listens on `127.0.0.1:39726` (loopback needs no key) and a `forwarder` container (socat, from the codesearch image by default) exposes it on port 39725. The chart refuses to render unless `networkPolicy.enabled` is true. | Clients cannot send headers and the admitted namespaces are trusted |
+
+Trade-off of `networkPolicy` mode: the NetworkPolicy is the **only** access control. Any pod it
+admits can search every indexed repo and call the management API (`POST /repos`,
+`DELETE /repos/<alias>`, reindex). It relies on a CNI that enforces NetworkPolicy, and
+`kubectl port-forward` or node-level processes bypass it. `CODESEARCH_ALLOWED_ROOTS` and Host
+validation still apply.
+
+```yaml
+auth:
+  mode: networkPolicy
+networkPolicy:
+  enabled: true
+  ingress:
+    namespaceSelectors:
+      - codesearch-client: "true"           # label client namespaces
+    extraPeers:
+      - namespaceSelector:                   # let Prometheus scrape
+          matchLabels:
+            kubernetes.io/metadata.name: monitoring
+```
+
+The Service's `targetPort` is the pod's `http` port (39725) in both modes, so client-side policies
+keyed to 39725 keep working.
 
 ## Repositories
 
-Each entry in `repositories` is cloned into `/repos/<alias>` by the `repo-sync` sidecar, which
-fetches every `repoSync.interval` seconds, registers new repos through `POST /repos` and
-requests a reindex when `HEAD` moves:
+The `repo-sync` sidecar keeps `repositories.urls` cloned under `/data/repos/<alias>`:
+
+- clones (shallow by default), fetches every `repositories.intervalSeconds`, registers each repo with
+  `POST /repos` (`202`, or `409` when already registered) and requests an incremental reindex when
+  `HEAD` moves;
+- with `repositories.prune` (default), unregisters (`DELETE /repos/<alias>`) and deletes checkouts
+  that are no longer listed. It owns `/data/repos`: do not put other checkouts there;
+- sends `repositories.tokenSecret` as an HTTP `Authorization` header through git's environment,
+  so the token is never written to disk;
+- when `/data/home/.codesearch/force-reindex` exists (for example after a restore), force-reindexes
+  every configured repo once and deletes the file.
 
 ```yaml
 repositories:
-  - url: https://github.com/example/service.git
-    branch: main   # default: the remote HEAD
-    depth: 1       # default 1; 0 clones full history
-    alias: service # default: repository name
-repoSync:
-  git:
-    existingSecret: git-token  # Secret with key `token`, for private HTTPS remotes
+  urls:
+    - https://github.com/example/service.git
+    - url: https://github.com/example/monorepo.git
+      branch: main
+      depth: 0          # full history
+      alias: mono
+  intervalSeconds: 300
+  tokenSecret:
+    name: git-token     # Secret with key `token`
+    key: token
 ```
 
-Without `repositories`, put checkouts on the `repos` volume yourself and register them with
-`POST /repos` (see the chart's NOTES output).
+## Monitoring
 
-## Monitoring and network access
+When the cluster serves the Prometheus Operator CRDs, the chart also renders (each can be turned off):
 
-- `metrics.serviceMonitor.enabled` creates a Prometheus Operator ServiceMonitor that scrapes
-  `/metrics` with the API key as bearer token.
-- `networkPolicy.enabled` limits ingress to the serve port from `networkPolicy.from` (default:
-  pods in the release namespace). Add the Ingress controller's and Prometheus's namespaces
-  there when they are elsewhere. `networkPolicy.egress` restricts egress (DNS is always
-  allowed); the sidecar needs HTTPS to your git hosts.
+- `serviceMonitor`: scrapes `/metrics`, with the API key as bearer token in `apiKey` mode.
+- `prometheusRule`: `CodesearchDown`, `CodesearchDegraded`, `CodesearchToolCallErrors`,
+  `CodesearchToolCallLatencyHigh`, `CodesearchRepoIndexFailing`, `CodesearchRepoIndexStale`,
+  `CodesearchIndexQueueBacklog`, `CodesearchHighMemory`, `CodesearchPVCAlmostFull` and
+  `CodesearchRestarting`, each with thresholds under `prometheusRule.rules.*` and a `runbook_url` into
+  the [runbooks](runbooks/README.md). `prometheusRule.additionalLabels` adds the labels your
+  Prometheus selects rules by (e.g. `release: kube-prometheus-stack`).
 
-All values are documented in the [chart README](../charts/codesearch/README.md).
+`dashboard.enabled` (default) renders a ConfigMap with the Grafana dashboard
+([`dashboards/codesearch.json`](../charts/codesearch/dashboards/codesearch.json)) labelled
+`grafana_dashboard: "1"` for the kube-prometheus-stack sidecar; `dashboard.namespace`,
+`dashboard.labels` and `dashboard.annotations` (e.g. `grafana_folder`) fit other sidecar setups.
+
+Backup, restore and upgrade procedures are in the [runbooks](runbooks/README.md#operations).
+
+## Extension points
+
+`extraInitContainers` and `extraContainers` are rendered through `tpl`, so they can reference values
+(`image: '{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}'`) and
+mount the `data` volume. `extraVolumes`, `extraVolumeMounts` (serve container), `extraEnv`,
+`extraEnvFrom`, `podAnnotations`, `podLabels`, `persistence.existingClaim`,
+`persistence.storageClassName` and `persistence.annotations` cover the rest. All values are listed in
+the [chart README](../charts/codesearch/README.md).

@@ -1304,22 +1304,26 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
     }
 }
 
+/// Resolves the `cache stats|clear [MODEL]` argument; `None` means every model.
+fn resolve_cache_model(model: Option<&str>) -> Result<Option<&'static str>> {
+    model
+        .map(|m| {
+            ModelType::parse(m)
+                .map(|mt| mt.short_name())
+                .ok_or_else(|| anyhow::anyhow!("Unknown model '{m}'"))
+        })
+        .transpose()
+}
+
 /// Show persistent cache statistics
 async fn run_cache_stats(model: Option<String>) -> Result<()> {
-    // Parse model name
-    let model_name = model
-        .as_deref()
-        .map(|m| ModelType::parse(m).map(|mt| mt.short_name()))
-        .ok_or_else(|| anyhow::anyhow!("Failed to parse model name"))?;
+    let model_name = resolve_cache_model(model.as_deref())?;
 
     if model_name.is_none() {
         eprintln!("Cache statistics for all models:");
     }
 
-    // Get cache directory
-    let cache_dir = crate::constants::get_global_models_cache_dir()
-        .unwrap_or_default()
-        .join("embedding_cache");
+    let cache_dir = crate::embed::PersistentEmbeddingCache::cache_root()?;
 
     if !cache_dir.exists() {
         if let Some(name) = model_name {
@@ -1356,6 +1360,7 @@ async fn run_cache_stats(model: Option<String>) -> Result<()> {
         // Show stats for all models
         let dir_entries = std::fs::read_dir(&cache_dir)?;
         let mut model_count = 0;
+        let mut total_entries = 0;
         let mut total_size = 0;
 
         println!("Persistent Cache Statistics (All Models)");
@@ -1365,7 +1370,8 @@ async fn run_cache_stats(model: Option<String>) -> Result<()> {
                 let model_name = entry.file_name().to_string_lossy().to_string();
                 let cache = crate::embed::PersistentEmbeddingCache::open(&model_name)?;
                 let stats = cache.stats()?;
-                model_count += stats.entries;
+                model_count += 1;
+                total_entries += stats.entries;
                 total_size += stats.file_size_bytes;
 
                 println!("  {}:", model_name);
@@ -1380,7 +1386,10 @@ async fn run_cache_stats(model: Option<String>) -> Result<()> {
                 );
             }
         }
-        println!("Total: {} models, {} bytes", model_count, total_size);
+        println!(
+            "Total: {} models, {} entries, {} bytes",
+            model_count, total_entries, total_size
+        );
     }
 
     Ok(())
@@ -1388,16 +1397,9 @@ async fn run_cache_stats(model: Option<String>) -> Result<()> {
 
 /// Clear persistent cache
 async fn run_cache_clear(model: Option<String>, yes: bool) -> Result<()> {
-    // Parse model name
-    let model_name = model
-        .as_deref()
-        .map(|m| ModelType::parse(m).map(|mt| mt.short_name()))
-        .ok_or_else(|| anyhow::anyhow!("Failed to parse model name"))?;
+    let model_name = resolve_cache_model(model.as_deref())?;
 
-    // Get cache directory
-    let cache_dir = crate::constants::get_global_models_cache_dir()
-        .unwrap_or_default()
-        .join("embedding_cache");
+    let cache_dir = crate::embed::PersistentEmbeddingCache::cache_root()?;
 
     if !cache_dir.exists() {
         eprintln!("No cache directory found: {}", cache_dir.display());
@@ -1965,6 +1967,33 @@ pub mod setup;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- cache stats / clear ------------------------------------------------
+
+    #[test]
+    fn test_resolve_cache_model() {
+        let cases: &[(Option<&str>, Result<Option<&str>, &str>)] = &[
+            (None, Ok(None)),
+            (Some("minilm-l6-q"), Ok(Some("minilm-l6-q"))),
+            (Some("AllMiniLML6V2Q"), Ok(Some("minilm-l6-q"))),
+            (Some("no-such-model"), Err("Unknown model 'no-such-model'")),
+        ];
+        for (input, want) in cases {
+            let got = resolve_cache_model(*input).map_err(|e| format!("{e:#}"));
+            assert_eq!(got, want.map_err(str::to_string), "input {input:?}");
+        }
+    }
+
+    #[test]
+    fn test_cache_root_is_the_embedding_cache_beside_models() {
+        let root = crate::embed::PersistentEmbeddingCache::cache_root().unwrap();
+        let models = crate::constants::get_global_models_cache_dir().unwrap();
+        assert_eq!(root, models.parent().unwrap().join("embedding_cache"));
+        assert_eq!(
+            crate::embed::PersistentEmbeddingCache::cache_dir_for("minilm-l6-q").unwrap(),
+            root.join("minilm-l6-q")
+        );
+    }
 
     // --- post-checkout hook generation / install ---------------------------
 

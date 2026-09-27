@@ -338,13 +338,16 @@ impl PersistentEmbeddingCache {
     /// already held open should use this instead of [`Self::open`], which would
     /// trip the double-open guard when the serve process already holds the env.
     pub fn cache_dir_for(model_name: &str) -> Result<PathBuf> {
+        Ok(Self::cache_root()?.join(model_name))
+    }
+
+    /// `~/.codesearch/embedding_cache`, the parent of every per-model cache directory.
+    pub fn cache_root() -> Result<PathBuf> {
         let models_dir = crate::constants::get_global_models_cache_dir()?;
-        let cache_dir = models_dir
+        Ok(models_dir
             .parent() // ~/.codesearch/
             .ok_or_else(|| anyhow::anyhow!("Could not get parent directory of models cache"))?
-            .join("embedding_cache")
-            .join(model_name);
-        Ok(cache_dir)
+            .join("embedding_cache"))
     }
 
     /// Read cache file statistics (`data.mdb` size + last modified) without

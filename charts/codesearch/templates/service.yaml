@@ -15,6 +15,7 @@ spec:
     {{- include "codesearch.selectorLabels" . | nindent 4 }}
   ports:
     - name: http
-      port: {{ .Values.service.port }}
+      port: {{ .Values.serve.port }}
+      # The forwarder in networkPolicy mode, serve itself in apiKey mode.
       targetPort: http
       protocol: TCP

@@ -4,7 +4,9 @@ metadata:
   name: {{ include "codesearch.fullname" . }}-test
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "codesearch.labels" . | nindent 4 }}
+    helm.sh/chart: {{ include "codesearch.chart" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: test
   annotations:
     helm.sh/hook: test
     helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
@@ -21,19 +23,23 @@ spec:
       args:
         - |
           set -eu
-          base="http://{{ include "codesearch.fullname" . }}:{{ .Values.service.port }}"
+          base="http://{{ include "codesearch.fullname" . }}:{{ .Values.serve.port }}"
+          set --
+          [ -n "${API_KEY:-}" ] && set -- -H "Authorization: Bearer $API_KEY"
           curl -fsS "$base/healthz"
-          curl -fsS -o /dev/null -H "Authorization: Bearer $API_KEY" "$base/metrics"
-          curl -fsS -H "Authorization: Bearer $API_KEY" \
+          curl -fsS -o /dev/null "$@" "$base/metrics"
+          curl -fsS "$@" \
             -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
             -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"helm-test","version":"1"}}}' \
             "$base/mcp" | grep -q '"serverInfo"'
           echo "codesearch answered healthz, metrics and MCP initialize"
+      {{- if include "codesearch.apiKeyAuth" . }}
       env:
         - name: API_KEY
           valueFrom:
             secretKeyRef:
               name: {{ include "codesearch.apiKeySecretName" . }}
               key: {{ include "codesearch.apiKeySecretKey" . }}
+      {{- end }}
       securityContext:
         {{- toYaml .Values.securityContext | nindent 8 }}

@@ -1,0 +1,263 @@
+# promtool unit tests for templates/prometheusrule.yaml, rendered with release
+# `codesearch` in namespace `codesearch` and default values (ci/monitoring-test.sh).
+rule_files:
+  - rules.yaml
+evaluation_interval: 1m
+
+tests:
+  - name: CodesearchDown fires when the target is down
+    interval: 1m
+    input_series:
+      - series: 'up{job="codesearch", namespace="codesearch", instance="10.0.0.1:39725"}'
+        values: '1 1 0x10'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: CodesearchDown
+        exp_alerts: []
+      - eval_time: 8m
+        alertname: CodesearchDown
+        exp_alerts:
+          - exp_labels: {severity: critical, job: codesearch, namespace: codesearch, instance: "10.0.0.1:39725"}
+            exp_annotations:
+              summary: codesearch in codesearch is down
+              description: Prometheus cannot scrape codesearch (10.0.0.1:39725) or the target is gone; MCP clients cannot search.
+              runbook_url: https://github.com/ryanmcafee/codesearch/blob/master/docs/runbooks/README.md#codesearchdown
+
+  - name: CodesearchDown fires when the target is absent
+    interval: 1m
+    input_series:
+      - series: 'up{job="other", namespace="codesearch"}'
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: CodesearchDown
+        exp_alerts:
+          - exp_labels: {severity: critical, job: codesearch, namespace: codesearch}
+            exp_annotations:
+              summary: codesearch in codesearch is down
+              description: Prometheus cannot scrape codesearch () or the target is gone; MCP clients cannot search.
+              runbook_url: https://github.com/ryanmcafee/codesearch/blob/master/docs/runbooks/README.md#codesearchdown
+
+  - name: CodesearchDegraded fires after 15 minutes degraded, not when ok
+    interval: 1m
+    input_series:
+      - series: 'codesearch_status{job="codesearch", namespace="codesearch", status="degraded"}'
+        values: '1x20'
+      - series: 'codesearch_status{job="codesearch", namespace="codesearch", status="ok"}'
+        values: '0x20'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: CodesearchDegraded
+        exp_alerts: []
+      - eval_time: 16m
+        alertname: CodesearchDegraded
+        exp_alerts:
+          - exp_labels: {severity: warning, job: codesearch, namespace: codesearch, status: degraded}
+            exp_annotations:
+              summary: codesearch in codesearch reports degraded health
+              description: codesearch has reported degraded for 15m; the reasons are in /api/summary.
+              runbook_url: https://github.com/ryanmcafee/codesearch/blob/master/docs/runbooks/README.md#codesearchdegraded
+
+  - name: CodesearchToolCallErrors fires above 5% failures
+    interval: 1m
+    input_series:
+      - series: 'codesearch_tool_call_failures_total{job="codesearch", namespace="codesearch", tool="search"}'
+        values: '0+6x40'
+      - series: 'codesearch_tool_call_duration_seconds_count{job="codesearch", namespace="codesearch", tool="search"}'
+        values: '0+60x40'
+    alert_rule_test:
+      - eval_time: 35m
+        alertname: CodesearchToolCallErrors
+        exp_alerts:
+          - exp_labels: {severity: warning}
+            exp_annotations:
+              summary: codesearch tool calls in codesearch are failing
+              description: 10% of MCP tool calls failed over the last 15 minutes (threshold 0.05).
+              runbook_url: https://github.com/ryanmcafee/codesearch/blob/master/docs/runbooks/README.md#codesearchtoolcallerrors
+
+  - name: CodesearchToolCallErrors stays quiet below 5% failures
+    interval: 1m
+    input_series:
+      - series: 'codesearch_tool_call_failures_total{job="codesearch", namespace="codesearch", tool="search"}'
+        values: '0+1x40'
+      - series: 'codesearch_tool_call_duration_seconds_count{job="codesearch", namespace="codesearch", tool="search"}'
+        values: '0+60x40'
+    alert_rule_test:
+      - eval_time: 35m
+        alertname: CodesearchToolCallErrors
+        exp_alerts: []
+
+  - name: CodesearchToolCallLatencyHigh fires when p95 exceeds the SLO
+    interval: 1m
+    input_series:
+      - series: 'codesearch_tool_call_duration_seconds_bucket{job="codesearch", namespace="codesearch", tool="search", le="1"}'
+        values: '0x40'
+      - series: 'codesearch_tool_call_duration_seconds_bucket{job="codesearch", namespace="codesearch", tool="search", le="10"}'
+        values: '0+10x40'
+      - series: 'codesearch_tool_call_duration_seconds_bucket{job="codesearch", namespace="codesearch", tool="search", le="+Inf"}'
+        values: '0+10x40'
+      - series: 'codesearch_slo_seconds{job="codesearch", namespace="codesearch"}'
+        values: '5x40'
+    alert_rule_test:
+      - eval_time: 35m
+        alertname: CodesearchToolCallLatencyHigh
+        exp_alerts:
+          - exp_labels: {severity: warning}
+            exp_annotations:
+              summary: codesearch tool calls in codesearch are slower than the SLO
+              description: p95 tool-call latency is 9.55s, above codesearch_slo_seconds (CODESEARCH_SLO_MS).
+              runbook_url: https://github.com/ryanmcafee/codesearch/blob/master/docs/runbooks/README.md#codesearchtoolcalllatencyhigh
+
+  - name: CodesearchToolCallLatencyHigh stays quiet within the SLO
+    interval: 1m
+    input_series:
+      - series: 'codesearch_tool_call_duration_seconds_bucket{job="codesearch", namespace="codesearch", tool="search", le="1"}'
+        values: '0+10x40'
+      - series: 'codesearch_tool_call_duration_seconds_bucket{job="codesearch", namespace="codesearch", tool="search", le="+Inf"}'
+        values: '0+10x40'
+      - series: 'codesearch_slo_seconds{job="codesearch", namespace="codesearch"}'
+        values: '5x40'
+    alert_rule_test:
+      - eval_time: 35m
+        alertname: CodesearchToolCallLatencyHigh
+        exp_alerts: []
+
+  - name: CodesearchRepoIndexFailing fires at three consecutive failures
+    interval: 1m
+    input_series:
+      - series: 'codesearch_repo_index_consecutive_failures{job="codesearch", namespace="codesearch", repo="svc"}'
+        values: '3x10'
+      - series: 'codesearch_repo_index_consecutive_failures{job="codesearch", namespace="codesearch", repo="ok"}'
+        values: '2x10'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: CodesearchRepoIndexFailing
+        exp_alerts:
+          - exp_labels: {severity: warning, job: codesearch, namespace: codesearch, repo: svc}
+            exp_annotations:
+              summary: codesearch cannot index svc
+              description: The last 3 index jobs of svc failed; search results for it are stale.
+              runbook_url: https://github.com/ryanmcafee/codesearch/blob/master/docs/runbooks/README.md#codesearchrepoindexfailing
+
+  - name: CodesearchRepoIndexStale fires only with pending changes
+    interval: 1m
+    input_series:
+      - series: 'codesearch_repo_last_indexed_timestamp_seconds{job="codesearch", namespace="codesearch", repo="svc"}'
+        values: '0x90'
+      - series: 'codesearch_repo_pending_changes{job="codesearch", namespace="codesearch", repo="svc"}'
+        values: '5x90'
+      - series: 'codesearch_repo_last_indexed_timestamp_seconds{job="codesearch", namespace="codesearch", repo="idle"}'
+        values: '0x90'
+      - series: 'codesearch_repo_pending_changes{job="codesearch", namespace="codesearch", repo="idle"}'
+        values: '0x90'
+    alert_rule_test:
+      - eval_time: 70m
+        alertname: CodesearchRepoIndexStale
+        exp_alerts: []
+      - eval_time: 80m
+        alertname: CodesearchRepoIndexStale
+        exp_alerts:
+          - exp_labels: {severity: warning, job: codesearch, namespace: codesearch, repo: svc}
+            exp_annotations:
+              summary: codesearch index of svc is stale
+              description: svc has unindexed changes and was last indexed 1h 20m 0s ago.
+              runbook_url: https://github.com/ryanmcafee/codesearch/blob/master/docs/runbooks/README.md#codesearchrepoindexstale
+
+  - name: CodesearchIndexQueueBacklog fires after 30 minutes above 5 queued repos
+    interval: 1m
+    input_series:
+      - series: 'codesearch_repos_queued{job="codesearch", namespace="codesearch"}'
+        values: '6x40'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CodesearchIndexQueueBacklog
+        exp_alerts: []
+      - eval_time: 31m
+        alertname: CodesearchIndexQueueBacklog
+        exp_alerts:
+          - exp_labels: {severity: warning, job: codesearch, namespace: codesearch}
+            exp_annotations:
+              summary: codesearch in codesearch has an indexing backlog
+              description: 6 repos have waited for an indexing slot for 30m.
+              runbook_url: https://github.com/ryanmcafee/codesearch/blob/master/docs/runbooks/README.md#codesearchindexqueuebacklog
+
+  - name: CodesearchHighMemory against the container limit
+    interval: 1m
+    input_series:
+      - series: 'container_memory_working_set_bytes{namespace="codesearch", pod="codesearch-7d9f8b6c5-abcde", container="codesearch"}'
+        values: '3800000000x20'
+      - series: 'kube_pod_container_resource_limits{namespace="codesearch", pod="codesearch-7d9f8b6c5-abcde", container="codesearch", resource="memory"}'
+        values: '4000000000x20'
+      - series: 'process_resident_memory_bytes{job="codesearch", namespace="codesearch", pod="codesearch-7d9f8b6c5-abcde"}'
+        values: '3800000000x20'
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: CodesearchHighMemory
+        exp_alerts:
+          - exp_labels: {severity: warning, basis: limit, namespace: codesearch, pod: codesearch-7d9f8b6c5-abcde}
+            exp_annotations:
+              summary: codesearch in codesearch is close to its memory limit
+              description: The codesearch container uses 95% of its memory limit; indexing may be OOM-killed.
+              runbook_url: https://github.com/ryanmcafee/codesearch/blob/master/docs/runbooks/README.md#codesearchhighmemory
+
+  - name: CodesearchHighMemory falls back to resident memory without limit metrics
+    interval: 1m
+    input_series:
+      - series: 'process_resident_memory_bytes{job="codesearch", namespace="codesearch", pod="codesearch-7d9f8b6c5-abcde"}'
+        values: '4000000000x20'
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: CodesearchHighMemory
+        exp_alerts:
+          - exp_labels: {severity: warning, basis: resident, namespace: codesearch, pod: codesearch-7d9f8b6c5-abcde}
+            exp_annotations:
+              summary: codesearch in codesearch uses a lot of memory
+              description: codesearch has 3.725GiB resident (threshold 3758096384 bytes); indexing may be OOM-killed.
+              runbook_url: https://github.com/ryanmcafee/codesearch/blob/master/docs/runbooks/README.md#codesearchhighmemory
+
+  - name: CodesearchPVCAlmostFull warns at 85% and is critical at 95%
+    interval: 1m
+    input_series:
+      - series: 'kubelet_volume_stats_used_bytes{namespace="codesearch", persistentvolumeclaim="codesearch-data"}'
+        values: '90x10 96x20'
+      - series: 'kubelet_volume_stats_capacity_bytes{namespace="codesearch", persistentvolumeclaim="codesearch-data"}'
+        values: '100x30'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: CodesearchPVCAlmostFull
+        exp_alerts:
+          - exp_labels: {severity: warning, namespace: codesearch, persistentvolumeclaim: codesearch-data}
+            exp_annotations:
+              summary: codesearch volume codesearch-data is 90% full
+              description: The data volume holding indexes, checkouts and the embedding cache is above 0.85; indexing fails when it fills up.
+              runbook_url: https://github.com/ryanmcafee/codesearch/blob/master/docs/runbooks/README.md#codesearchpvcalmostfull
+      - eval_time: 25m
+        alertname: CodesearchPVCAlmostFull
+        exp_alerts:
+          - exp_labels: {severity: critical, namespace: codesearch, persistentvolumeclaim: codesearch-data}
+            exp_annotations:
+              summary: codesearch volume codesearch-data is 96% full
+              description: The data volume holding indexes, checkouts and the embedding cache is above 0.95; indexing fails when it fills up.
+              runbook_url: https://github.com/ryanmcafee/codesearch/blob/master/docs/runbooks/README.md#codesearchpvcalmostfull
+          - exp_labels: {severity: warning, namespace: codesearch, persistentvolumeclaim: codesearch-data}
+            exp_annotations:
+              summary: codesearch volume codesearch-data is 96% full
+              description: The data volume holding indexes, checkouts and the embedding cache is above 0.85; indexing fails when it fills up.
+              runbook_url: https://github.com/ryanmcafee/codesearch/blob/master/docs/runbooks/README.md#codesearchpvcalmostfull
+
+  - name: CodesearchRestarting fires above 3 restarts in an hour, ignores other pods
+    interval: 1m
+    input_series:
+      - series: 'kube_pod_container_status_restarts_total{namespace="codesearch", pod="codesearch-7d9f8b6c5-abcde", container="codesearch"}'
+        values: '0 0 1 2 3 4 5 5 5 5'
+      - series: 'kube_pod_container_status_restarts_total{namespace="codesearch", pod="other-7d9f8b6c5-abcde", container="other"}'
+        values: '0 0 1 2 3 4 5 5 5 5'
+    alert_rule_test:
+      - eval_time: 9m
+        alertname: CodesearchRestarting
+        exp_alerts:
+          - exp_labels: {severity: warning, namespace: codesearch, pod: codesearch-7d9f8b6c5-abcde, container: codesearch}
+            exp_annotations:
+              summary: codesearch container codesearch is restarting
+              description: codesearch-7d9f8b6c5-abcde/codesearch restarted 5 times in the last hour.
+              runbook_url: https://github.com/ryanmcafee/codesearch/blob/master/docs/runbooks/README.md#codesearchrestarting

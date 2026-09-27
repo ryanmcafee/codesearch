@@ -60,12 +60,38 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
 {{- define "codesearch.dataClaimName" -}}
-{{- default (printf "%s-data" (include "codesearch.fullname" .)) .Values.persistence.data.existingClaim }}
+{{- default (printf "%s-data" (include "codesearch.fullname" .)) .Values.persistence.existingClaim }}
 {{- end }}
 
-{{- define "codesearch.reposClaimName" -}}
-{{- default (printf "%s-repos" (include "codesearch.fullname" .)) .Values.persistence.repos.existingClaim }}
+{{- define "codesearch.apiKeyAuth" -}}
+{{- if eq .Values.auth.mode "apiKey" }}true{{ end }}
 {{- end }}
+
+{{/* Address serve binds: the pod IP in apiKey mode, loopback behind the forwarder otherwise. */}}
+{{- define "codesearch.serveHost" -}}
+{{- if include "codesearch.apiKeyAuth" . }}0.0.0.0{{ else }}127.0.0.1{{ end }}
+{{- end }}
+
+{{- define "codesearch.servePort" -}}
+{{- if include "codesearch.apiKeyAuth" . }}{{ .Values.serve.port }}{{ else }}{{ .Values.serve.internalPort }}{{ end }}
+{{- end }}
+
+{{- define "codesearch.forwarderImage" -}}
+{{- $img := .Values.forwarder.image -}}
+{{- if $img.repository -}}
+{{- if $img.digest -}}
+{{- printf "%s@%s" $img.repository $img.digest -}}
+{{- else -}}
+{{- printf "%s:%s" $img.repository (required "forwarder.image.tag is required with forwarder.image.repository" $img.tag) -}}
+{{- end -}}
+{{- else -}}
+{{- include "codesearch.image" . -}}
+{{- end -}}
+{{- end }}
+
+{{- define "codesearch.reposRoot" -}}/data/repos{{- end }}
+
+{{- define "codesearch.stateDir" -}}/data/home/.codesearch{{- end }}
 
 {{/*
 Host header values the MCP endpoint accepts: the Service's DNS names, loopback
@@ -85,5 +111,14 @@ Host header values the MCP endpoint accepts: the Service's DNS names, loopback
 {{- end }}
 
 {{- define "codesearch.allowedRoots" -}}
-{{- join ";" (uniq (prepend .Values.allowedRoots .Values.persistence.repos.mountPath)) -}}
+{{- join ";" (uniq (prepend .Values.allowedRoots (include "codesearch.reposRoot" .))) -}}
+{{- end }}
+
+{{/* Prometheus selector for this release's scrape target. */}}
+{{- define "codesearch.promSelector" -}}
+job="{{ include "codesearch.fullname" . }}", namespace="{{ .Release.Namespace }}"
+{{- end }}
+
+{{- define "codesearch.podRegex" -}}
+{{ include "codesearch.fullname" . }}-[a-z0-9]+-[a-z0-9]+
 {{- end }}

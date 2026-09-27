@@ -1,8 +1,14 @@
-codesearch {{ .Chart.AppVersion }} is running as {{ include "codesearch.fullname" . }} in namespace {{ .Release.Namespace }}.
+codesearch {{ .Chart.AppVersion }} is running as {{ include "codesearch.fullname" . }} in namespace {{ .Release.Namespace }} (auth.mode={{ .Values.auth.mode }}).
+{{- $apiKey := include "codesearch.apiKeyAuth" . }}
+{{- if $apiKey }}
 
 1. Read the API key:
 
   export CODESEARCH_API_KEY=$(kubectl get secret -n {{ .Release.Namespace }} {{ include "codesearch.apiKeySecretName" . }} -o jsonpath='{.data.{{ include "codesearch.apiKeySecretKey" . }}}' | base64 -d)
+{{- else }}
+
+1. No API key: only pods the NetworkPolicy admits reach the server.
+{{- end }}
 
 2. Reach the server:
 {{- if .Values.ingress.enabled }}
@@ -12,25 +18,25 @@ codesearch {{ .Chart.AppVersion }} is running as {{ include "codesearch.fullname
 {{- end }}
 {{- else }}
 
-  kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "codesearch.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }}
-  export CODESEARCH_URL=http://localhost:{{ .Values.service.port }}
+  kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "codesearch.fullname" . }} {{ .Values.serve.port }}:{{ .Values.serve.port }}
+  export CODESEARCH_URL=http://localhost:{{ .Values.serve.port }}
 {{- end }}
 
-  In-cluster clients use http://{{ include "codesearch.fullname" . }}.{{ .Release.Namespace }}.svc.{{ .Values.clusterDomain }}:{{ .Values.service.port }}
+  In-cluster clients use http://{{ include "codesearch.fullname" . }}.{{ .Release.Namespace }}.svc.{{ .Values.clusterDomain }}:{{ .Values.serve.port }}
 
 3. Connect Claude Code:
 
-  claude mcp add --transport http codesearch "$CODESEARCH_URL/mcp" --header "Authorization: Bearer $CODESEARCH_API_KEY"
+  claude mcp add --transport http codesearch "$CODESEARCH_URL/mcp"{{ if $apiKey }} --header "Authorization: Bearer $CODESEARCH_API_KEY"{{ end }}
 
-{{- if .Values.repositories }}
+{{- if .Values.repositories.urls }}
 
-The repo-sync sidecar clones and registers {{ len .Values.repositories }} repositor{{ if eq (len .Values.repositories) 1 }}y{{ else }}ies{{ end }} under {{ .Values.persistence.repos.mountPath }}:
+The repo-sync sidecar clones and registers {{ len .Values.repositories.urls }} repositor{{ if eq (len .Values.repositories.urls) 1 }}y{{ else }}ies{{ end }} under {{ include "codesearch.reposRoot" . }}:
 
   kubectl logs -n {{ .Release.Namespace }} deploy/{{ include "codesearch.fullname" . }} -c repo-sync
 {{- else }}
 
-Register a repository that exists under {{ .Values.persistence.repos.mountPath }}:
+Register a repository that exists under {{ include "codesearch.reposRoot" . }}:
 
-  curl -X POST -H "Authorization: Bearer $CODESEARCH_API_KEY" -H 'Content-Type: application/json' \
-    -d '{"path":"{{ .Values.persistence.repos.mountPath }}/<name>"}' "$CODESEARCH_URL/repos"
+  curl -X POST{{ if $apiKey }} -H "Authorization: Bearer $CODESEARCH_API_KEY"{{ end }} -H 'Content-Type: application/json' \
+    -d '{"path":"{{ include "codesearch.reposRoot" . }}/<name>"}' "$CODESEARCH_URL/repos"
 {{- end }}

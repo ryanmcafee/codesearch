@@ -1,0 +1,20 @@
+# Extension points: tpl-rendered extra containers, extra volumes, existing claim.
+persistence:
+  existingClaim: restored-data
+extraInitContainers:
+  - name: restore
+    image: '{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}'
+    command: ["sh", "-c", "ls /data"]
+    volumeMounts:
+      - name: data
+        mountPath: /data
+extraContainers:
+  - name: sidecar
+    image: '{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}'
+    command: ["sleep", "infinity"]
+extraVolumes:
+  - name: scratch
+    emptyDir: {}
+extraVolumeMounts:
+  - name: scratch
+    mountPath: /scratch

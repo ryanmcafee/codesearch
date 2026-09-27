@@ -20,51 +20,74 @@ serviceAccount:
   annotations: {}
   automountServiceAccountToken: false
 
-# MCP sessions live in the serve process's memory and indexes are written by a
-# single process, so the chart always runs exactly one replica.
+# The chart always runs exactly one replica: MCP sessions live in the serve
+# process's memory and each index has a single writer. Recreate also keeps two
+# pods from mounting the ReadWriteOnce data volume during a rollout.
+strategy:
+  type: Recreate
 
 auth:
-  # Existing Secret holding the API key; when empty the chart creates one and
-  # keeps its key stable across upgrades.
+  # apiKey: serve listens on the pod IP and every route except /healthz needs the key.
+  # networkPolicy: serve listens on loopback (no key) behind a TCP forwarder; the
+  #   NetworkPolicy is the only access control, so networkPolicy.enabled is required.
+  mode: apiKey
+  # apiKey mode: existing Secret holding the key; when empty the chart creates one
+  # and keeps its key stable across upgrades.
   existingSecret: ""
   existingSecretKey: api-key
-  # Explicit key for the chart-created Secret; random when empty.
+  # apiKey mode: explicit key for the chart-created Secret; random when empty.
   apiKey: ""
+
+# networkPolicy mode: forwards the Service port to serve on loopback.
+forwarder:
+  # Empty fields default to the codesearch image, which ships socat.
+  image:
+    repository: ""
+    tag: ""
+    digest: ""
+    pullPolicy: ""
+  resources:
+    requests:
+      cpu: 10m
+      memory: 16Mi
+    limits:
+      memory: 64Mi
 
 # Extra Host header values accepted by /mcp. The Service DNS names, loopback and
 # Ingress hosts are always included.
 allowedHosts: []
-# Extra roots (besides persistence.repos.mountPath) POST /repos may register.
+# Extra roots (besides /data/repos) POST /repos may register.
 allowedRoots: []
 clusterDomain: cluster.local
 
 serve:
+  # Port of the Service and of the pod's `http` port.
   port: 39725
-  # Extra arguments appended to `codesearch serve --host 0.0.0.0 --no-tui`.
+  # networkPolicy mode: loopback port serve listens on behind the forwarder.
+  internalPort: 39726
+  # Extra arguments appended to `codesearch serve --host ... --port ... --no-tui`.
   extraArgs: []
 
 extraEnv: []
 extraEnvFrom: []
 
-# Git repositories cloned into persistence.repos.mountPath, kept up to date and
-# registered with codesearch by the repo-sync sidecar.
-repositories: []
-  # - url: https://github.com/ryanmcafee/codesearch.git
-  #   # Defaults to the last URL path segment without .git.
-  #   alias: codesearch
-  #   # Defaults to the remote HEAD.
-  #   branch: develop
-  #   # Shallow clone depth; 0 clones full history.
-  #   depth: 1
-
-repoSync:
-  # Seconds between fetches.
-  interval: 300
-  git:
-    # Secret with a token for HTTPS clones of private repositories.
-    existingSecret: ""
-    tokenKey: token
-    username: x-access-token
+# Git repositories cloned into /data/repos by the repo-sync sidecar, fetched every
+# intervalSeconds, registered with POST /repos and reindexed when HEAD moves.
+repositories:
+  # HTTPS URLs, or objects {url, alias, branch, depth}. alias defaults to the last
+  # path segment without .git, branch to the remote HEAD.
+  urls: []
+  intervalSeconds: 300
+  # Shallow clone depth; 0 clones full history.
+  depth: 1
+  # Secret with a token for private remotes, sent as an HTTP Authorization header
+  # from the environment (never written to disk).
+  tokenSecret:
+    name: ""
+    key: token
+  username: x-access-token
+  # Unregister and delete checkouts under /data/repos that are no longer listed.
+  prune: true
   resources:
     requests:
       cpu: 10m
@@ -72,29 +95,22 @@ repoSync:
     limits:
       memory: 256Mi
 
+# One volume named `data`, mounted at /data (HOME is /data/home):
+#   /data/home/.codesearch  repos.json, embedding_cache/, logs/, models/
+#   /data/repos             checkouts; each repo's index is <repo>/.codesearch.db
+# Touch /data/home/.codesearch/force-reindex (e.g. after a restore) to make
+# repo-sync force-reindex every configured repo once; it deletes the file after.
 persistence:
-  # $HOME/.codesearch: repos.json, embedding cache, logs, the embedding model.
-  data:
-    enabled: true
-    existingClaim: ""
-    storageClass: ""
-    accessModes: [ReadWriteOnce]
-    size: 5Gi
-    mountPath: /home/app/.codesearch
-    annotations: {}
-  # Repository checkouts; each repo's index lives in <repo>/.codesearch.db.
-  repos:
-    enabled: true
-    existingClaim: ""
-    storageClass: ""
-    accessModes: [ReadWriteOnce]
-    size: 20Gi
-    mountPath: /repos
-    annotations: {}
+  enabled: true
+  existingClaim: ""
+  # "-" sets storageClassName: "" (no dynamic provisioning).
+  storageClassName: ""
+  accessModes: [ReadWriteOnce]
+  size: 20Gi
+  annotations: {}
 
 service:
   type: ClusterIP
-  port: 39725
   annotations: {}
 
 ingress:
@@ -108,17 +124,86 @@ ingress:
     #       pathType: Prefix
   tls: []
 
-metrics:
-  serviceMonitor:
-    enabled: false
-    interval: 30s
-    scrapeTimeout: 10s
-    labels: {}
+# Rendered only when the cluster serves monitoring.coreos.com/v1 ServiceMonitor.
+serviceMonitor:
+  enabled: true
+  interval: 30s
+  scrapeTimeout: 10s
+  labels: {}
+  relabelings: []
+  metricRelabelings: []
+
+# Rendered only when the cluster serves monitoring.coreos.com/v1 PrometheusRule.
+prometheusRule:
+  enabled: true
+  additionalLabels: {}
+  # Each alert links to <runbookBaseUrl>#<alert name in lower case>.
+  runbookBaseUrl: https://github.com/ryanmcafee/codesearch/blob/master/docs/runbooks/README.md
+  rules:
+    down:
+      enabled: true
+      for: 5m
+    degraded:
+      enabled: true
+      for: 15m
+    toolCallErrors:
+      enabled: true
+      # Failed / all tool calls over 15 minutes.
+      ratio: 0.05
+      for: 15m
+    toolCallLatency:
+      enabled: true
+      # p95 over 15 minutes above codesearch_slo_seconds.
+      for: 15m
+    repoIndexFailing:
+      enabled: true
+      consecutiveFailures: 3
+      for: 5m
+    repoIndexStale:
+      enabled: true
+      # Seconds since the last successful index while changes are pending.
+      maxAgeSeconds: 3600
+      for: 15m
+    indexQueueBacklog:
+      enabled: true
+      queuedRepos: 5
+      for: 30m
+    highMemory:
+      enabled: true
+      # Working set / memory limit (cAdvisor + kube-state-metrics); without
+      # kube-state-metrics, resident memory above residentBytes.
+      limitRatio: 0.9
+      residentBytes: 3758096384
+      for: 15m
+    pvcAlmostFull:
+      enabled: true
+      warningRatio: 0.85
+      criticalRatio: 0.95
+      for: 10m
+    restarting:
+      enabled: true
+      # Container restarts within one hour.
+      restarts: 3
+
+# Grafana dashboard ConfigMap for the Grafana dashboard sidecar (kube-prometheus-stack).
+dashboard:
+  enabled: true
+  # Defaults to the release namespace.
+  namespace: ""
+  labels:
+    grafana_dashboard: "1"
+  # e.g. grafana_folder: codesearch (the sidecar's folderAnnotation).
+  annotations: {}
 
 networkPolicy:
   enabled: false
-  # Peers allowed to reach the serve port; empty allows every pod in the namespace.
-  from: []
+  ingress:
+    # Namespaces (matchLabels) whose pods may reach the Service port, e.g.
+    # - codesearch-client: "true"
+    namespaceSelectors: []
+    # Extra NetworkPolicyPeer entries, e.g. the monitoring namespace for scraping.
+    # With neither, pods in the release namespace are allowed.
+    extraPeers: []
   # Egress rules; empty leaves egress unrestricted. DNS is always allowed when set.
   egress: []
 
@@ -166,6 +251,14 @@ startupProbe:
     port: http
   periodSeconds: 5
   failureThreshold: 60
+
+# Rendered through tpl, so they may reference chart values, e.g.
+# image: '{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}'
+extraInitContainers: []
+extraContainers: []
+# Extra pod volumes, and extra mounts for the serve container.
+extraVolumes: []
+extraVolumeMounts: []
 
 terminationGracePeriodSeconds: 30
 priorityClassName: ""

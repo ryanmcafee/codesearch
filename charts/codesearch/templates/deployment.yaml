@@ -9,7 +9,7 @@ spec:
   # One replica only: MCP sessions are held in memory and indexes have a single writer.
   replicas: 1
   strategy:
-    type: Recreate
+    {{- toYaml .Values.strategy | nindent 4 }}
   selector:
     matchLabels:
       {{- include "codesearch.selectorLabels" . | nindent 6 }}
@@ -45,14 +45,19 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command: ["/bin/sh", "-c"]
           args:
-            - mkdir -p /seed/models && cp -a --update=none /home/app/.codesearch/models/. /seed/models/
+            - >-
+              mkdir -p {{ include "codesearch.stateDir" . }}/models {{ include "codesearch.reposRoot" . }}
+              && cp -a --update=none /home/app/.codesearch/models/. {{ include "codesearch.stateDir" . }}/models/
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
           resources:
-            {{- toYaml .Values.repoSync.resources | nindent 12 }}
+            {{- toYaml .Values.repositories.resources | nindent 12 }}
           volumeMounts:
             - name: data
-              mountPath: /seed
+              mountPath: /data
+        {{- with .Values.extraInitContainers }}
+        {{- tpl (toYaml .) $ | nindent 8 }}
+        {{- end }}
       containers:
         - name: codesearch
           image: {{ include "codesearch.image" . }}
@@ -60,23 +65,29 @@ spec:
           args:
             - serve
             - --host
-            - 0.0.0.0
+            - {{ include "codesearch.serveHost" . }}
             - --port
-            - {{ .Values.serve.port | quote }}
+            - {{ include "codesearch.servePort" . | quote }}
             - --no-tui
             {{- range .Values.serve.extraArgs }}
             - {{ . | quote }}
             {{- end }}
+          {{- if include "codesearch.apiKeyAuth" . }}
           ports:
             - name: http
               containerPort: {{ .Values.serve.port }}
               protocol: TCP
+          {{- end }}
           env:
+            - name: HOME
+              value: /data/home
+            {{- if include "codesearch.apiKeyAuth" . }}
             - name: CODESEARCH_SERVE_API_KEY
               valueFrom:
                 secretKeyRef:
                   name: {{ include "codesearch.apiKeySecretName" . }}
                   key: {{ include "codesearch.apiKeySecretKey" . }}
+            {{- end }}
             - name: CODESEARCH_ALLOWED_HOSTS
               value: {{ include "codesearch.allowedHosts" . | quote }}
             - name: CODESEARCH_ALLOWED_ROOTS
@@ -106,12 +117,31 @@ spec:
             {{- toYaml .Values.resources | nindent 12 }}
           volumeMounts:
             - name: data
-              mountPath: {{ .Values.persistence.data.mountPath }}
-            - name: repos
-              mountPath: {{ .Values.persistence.repos.mountPath }}
+              mountPath: /data
             - name: tmp
               mountPath: /tmp
-        {{- if .Values.repositories }}
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+        {{- if not (include "codesearch.apiKeyAuth" .) }}
+        # Serve only listens on loopback in networkPolicy mode; this exposes it on the pod IP.
+        - name: forwarder
+          image: {{ include "codesearch.forwarderImage" . }}
+          imagePullPolicy: {{ .Values.forwarder.image.pullPolicy | default .Values.image.pullPolicy }}
+          command:
+            - socat
+            - TCP-LISTEN:{{ .Values.serve.port }},fork,reuseaddr
+            - TCP:127.0.0.1:{{ .Values.serve.internalPort }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.serve.port }}
+              protocol: TCP
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          resources:
+            {{- toYaml .Values.forwarder.resources | nindent 12 }}
+        {{- end }}
+        {{- if .Values.repositories.urls }}
         - name: repo-sync
           image: {{ include "codesearch.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
@@ -120,64 +150,66 @@ spec:
             - name: HOME
               value: /tmp
             - name: REPOS_ROOT
-              value: {{ .Values.persistence.repos.mountPath | quote }}
+              value: {{ include "codesearch.reposRoot" . }}
             - name: REPOS_FILE
               value: /etc/codesearch/repositories
+            - name: FORCE_REINDEX_MARKER
+              value: {{ include "codesearch.stateDir" . }}/force-reindex
             - name: SERVE_PORT
-              value: {{ .Values.serve.port | quote }}
+              value: {{ include "codesearch.servePort" . | quote }}
             - name: SYNC_INTERVAL
-              value: {{ .Values.repoSync.interval | quote }}
+              value: {{ .Values.repositories.intervalSeconds | quote }}
+            - name: PRUNE
+              value: {{ .Values.repositories.prune | quote }}
+            {{- if include "codesearch.apiKeyAuth" . }}
             - name: CODESEARCH_SERVE_API_KEY
               valueFrom:
                 secretKeyRef:
                   name: {{ include "codesearch.apiKeySecretName" . }}
                   key: {{ include "codesearch.apiKeySecretKey" . }}
-            {{- with .Values.repoSync.git.existingSecret }}
-            - name: GIT_CREDENTIAL_HELPER
-              value: /etc/codesearch/git-credential.sh
+            {{- end }}
+            {{- with .Values.repositories.tokenSecret.name }}
             - name: GIT_USERNAME
-              value: {{ $.Values.repoSync.git.username | quote }}
+              value: {{ $.Values.repositories.username | quote }}
             - name: GIT_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: {{ . }}
-                  key: {{ $.Values.repoSync.git.tokenKey }}
+                  key: {{ $.Values.repositories.tokenSecret.key }}
             {{- end }}
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
           resources:
-            {{- toYaml .Values.repoSync.resources | nindent 12 }}
+            {{- toYaml .Values.repositories.resources | nindent 12 }}
           volumeMounts:
-            - name: repos
-              mountPath: {{ .Values.persistence.repos.mountPath }}
+            - name: data
+              mountPath: /data
             - name: tmp
               mountPath: /tmp
             - name: repo-sync
               mountPath: /etc/codesearch
               readOnly: true
         {{- end }}
+        {{- with .Values.extraContainers }}
+        {{- tpl (toYaml .) $ | nindent 8 }}
+        {{- end }}
       volumes:
         - name: data
-          {{- if .Values.persistence.data.enabled }}
+          {{- if .Values.persistence.enabled }}
           persistentVolumeClaim:
             claimName: {{ include "codesearch.dataClaimName" . }}
           {{- else }}
           emptyDir: {}
           {{- end }}
-        - name: repos
-          {{- if .Values.persistence.repos.enabled }}
-          persistentVolumeClaim:
-            claimName: {{ include "codesearch.reposClaimName" . }}
-          {{- else }}
-          emptyDir: {}
-          {{- end }}
         - name: tmp
           emptyDir: {}
-        {{- if .Values.repositories }}
+        {{- if .Values.repositories.urls }}
         - name: repo-sync
           configMap:
             name: {{ include "codesearch.fullname" . }}-repo-sync
-            defaultMode: 0555
+        {{- end }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
         {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:

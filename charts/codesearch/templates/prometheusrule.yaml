@@ -1,0 +1,157 @@
+{{- if and .Values.prometheusRule.enabled (.Capabilities.APIVersions.Has "monitoring.coreos.com/v1/PrometheusRule") }}
+{{- $r := .Values.prometheusRule.rules }}
+{{- $sel := include "codesearch.promSelector" . }}
+{{- $ns := .Release.Namespace }}
+{{- $pod := include "codesearch.podRegex" . }}
+{{- $runbook := .Values.prometheusRule.runbookBaseUrl }}
+{{- $claim := include "codesearch.dataClaimName" . }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "codesearch.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "codesearch.labels" . | nindent 4 }}
+    {{- with .Values.prometheusRule.additionalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: codesearch
+      rules:
+        {{- if $r.down.enabled }}
+        - alert: CodesearchDown
+          expr: up{ {{- $sel -}} } == 0 or absent(up{ {{- $sel -}} })
+          for: {{ $r.down.for }}
+          labels:
+            severity: critical
+          annotations:
+            summary: 'codesearch in {{ $ns }} is down'
+            description: 'Prometheus cannot scrape codesearch ({{ `{{ $labels.instance }}` }}) or the target is gone; MCP clients cannot search.'
+            runbook_url: {{ $runbook }}#codesearchdown
+        {{- end }}
+        {{- if $r.degraded.enabled }}
+        - alert: CodesearchDegraded
+          expr: codesearch_status{ {{- $sel -}}, status="degraded"} == 1
+          for: {{ $r.degraded.for }}
+          labels:
+            severity: warning
+          annotations:
+            summary: 'codesearch in {{ $ns }} reports degraded health'
+            description: 'codesearch has reported degraded for {{ $r.degraded.for }}; the reasons are in /api/summary.'
+            runbook_url: {{ $runbook }}#codesearchdegraded
+        {{- end }}
+        {{- if $r.toolCallErrors.enabled }}
+        - alert: CodesearchToolCallErrors
+          expr: |-
+            sum(rate(codesearch_tool_call_failures_total{ {{- $sel -}} }[15m]))
+              / sum(rate(codesearch_tool_call_duration_seconds_count{ {{- $sel -}} }[15m]))
+              > {{ $r.toolCallErrors.ratio }}
+          for: {{ $r.toolCallErrors.for }}
+          labels:
+            severity: warning
+          annotations:
+            summary: 'codesearch tool calls in {{ $ns }} are failing'
+            description: '{{ `{{ $value | humanizePercentage }}` }} of MCP tool calls failed over the last 15 minutes (threshold {{ $r.toolCallErrors.ratio }}).'
+            runbook_url: {{ $runbook }}#codesearchtoolcallerrors
+        {{- end }}
+        {{- if $r.toolCallLatency.enabled }}
+        - alert: CodesearchToolCallLatencyHigh
+          expr: |-
+            histogram_quantile(0.95, sum by (le) (rate(codesearch_tool_call_duration_seconds_bucket{ {{- $sel -}} }[15m])))
+              > on() max(codesearch_slo_seconds{ {{- $sel -}} })
+          for: {{ $r.toolCallLatency.for }}
+          labels:
+            severity: warning
+          annotations:
+            summary: 'codesearch tool calls in {{ $ns }} are slower than the SLO'
+            description: 'p95 tool-call latency is {{ `{{ $value | humanizeDuration }}` }}, above codesearch_slo_seconds (CODESEARCH_SLO_MS).'
+            runbook_url: {{ $runbook }}#codesearchtoolcalllatencyhigh
+        {{- end }}
+        {{- if $r.repoIndexFailing.enabled }}
+        - alert: CodesearchRepoIndexFailing
+          expr: codesearch_repo_index_consecutive_failures{ {{- $sel -}} } >= {{ $r.repoIndexFailing.consecutiveFailures }}
+          for: {{ $r.repoIndexFailing.for }}
+          labels:
+            severity: warning
+          annotations:
+            summary: 'codesearch cannot index {{ `{{ $labels.repo }}` }}'
+            description: 'The last {{ `{{ $value }}` }} index jobs of {{ `{{ $labels.repo }}` }} failed; search results for it are stale.'
+            runbook_url: {{ $runbook }}#codesearchrepoindexfailing
+        {{- end }}
+        {{- if $r.repoIndexStale.enabled }}
+        - alert: CodesearchRepoIndexStale
+          expr: |-
+            (time() - codesearch_repo_last_indexed_timestamp_seconds{ {{- $sel -}} } > {{ $r.repoIndexStale.maxAgeSeconds }})
+              and codesearch_repo_pending_changes{ {{- $sel -}} } > 0
+          for: {{ $r.repoIndexStale.for }}
+          labels:
+            severity: warning
+          annotations:
+            summary: 'codesearch index of {{ `{{ $labels.repo }}` }} is stale'
+            description: '{{ `{{ $labels.repo }}` }} has unindexed changes and was last indexed {{ `{{ $value | humanizeDuration }}` }} ago.'
+            runbook_url: {{ $runbook }}#codesearchrepoindexstale
+        {{- end }}
+        {{- if $r.indexQueueBacklog.enabled }}
+        - alert: CodesearchIndexQueueBacklog
+          expr: codesearch_repos_queued{ {{- $sel -}} } > {{ $r.indexQueueBacklog.queuedRepos }}
+          for: {{ $r.indexQueueBacklog.for }}
+          labels:
+            severity: warning
+          annotations:
+            summary: 'codesearch in {{ $ns }} has an indexing backlog'
+            description: '{{ `{{ $value }}` }} repos have waited for an indexing slot for {{ $r.indexQueueBacklog.for }}.'
+            runbook_url: {{ $runbook }}#codesearchindexqueuebacklog
+        {{- end }}
+        {{- if $r.highMemory.enabled }}
+        {{- $ws := printf "max by (namespace, pod) (container_memory_working_set_bytes{namespace=\"%s\", pod=~\"%s\", container=\"codesearch\"})" $ns $pod }}
+        {{- $limit := printf "max by (namespace, pod) (kube_pod_container_resource_limits{namespace=\"%s\", pod=~\"%s\", container=\"codesearch\", resource=\"memory\"})" $ns $pod }}
+        - alert: CodesearchHighMemory
+          expr: {{ $ws }} / {{ $limit }} > {{ $r.highMemory.limitRatio }}
+          for: {{ $r.highMemory.for }}
+          labels:
+            severity: warning
+            basis: limit
+          annotations:
+            summary: 'codesearch in {{ $ns }} is close to its memory limit'
+            description: 'The codesearch container uses {{ `{{ $value | humanizePercentage }}` }} of its memory limit; indexing may be OOM-killed.'
+            runbook_url: {{ $runbook }}#codesearchhighmemory
+        # Without kube-state-metrics there is no limit to compare with; use resident memory.
+        - alert: CodesearchHighMemory
+          expr: |-
+            max by (namespace, pod) (process_resident_memory_bytes{ {{- $sel -}} }) > {{ $r.highMemory.residentBytes | int64 }}
+              unless on() {{ $limit }}
+          for: {{ $r.highMemory.for }}
+          labels:
+            severity: warning
+            basis: resident
+          annotations:
+            summary: 'codesearch in {{ $ns }} uses a lot of memory'
+            description: 'codesearch has {{ `{{ $value | humanize1024 }}` }}B resident (threshold {{ $r.highMemory.residentBytes | int64 }} bytes); indexing may be OOM-killed.'
+            runbook_url: {{ $runbook }}#codesearchhighmemory
+        {{- end }}
+        {{- if and $r.pvcAlmostFull.enabled .Values.persistence.enabled }}
+        {{- $usage := printf "kubelet_volume_stats_used_bytes{namespace=\"%s\", persistentvolumeclaim=\"%s\"} / kubelet_volume_stats_capacity_bytes{namespace=\"%s\", persistentvolumeclaim=\"%s\"}" $ns $claim $ns $claim }}
+        {{- range $severity, $ratio := dict "warning" $r.pvcAlmostFull.warningRatio "critical" $r.pvcAlmostFull.criticalRatio }}
+        - alert: CodesearchPVCAlmostFull
+          expr: {{ $usage }} > {{ $ratio }}
+          for: {{ $r.pvcAlmostFull.for }}
+          labels:
+            severity: {{ $severity }}
+          annotations:
+            summary: 'codesearch volume {{ $claim }} is {{ `{{ $value | humanizePercentage }}` }} full'
+            description: 'The data volume holding indexes, checkouts and the embedding cache is above {{ $ratio }}; indexing fails when it fills up.'
+            runbook_url: {{ $runbook }}#codesearchpvcalmostfull
+        {{- end }}
+        {{- end }}
+        {{- if $r.restarting.enabled }}
+        - alert: CodesearchRestarting
+          expr: increase(kube_pod_container_status_restarts_total{namespace="{{ $ns }}", pod=~"{{ $pod }}"}[1h]) > {{ $r.restarting.restarts }}
+          labels:
+            severity: warning
+          annotations:
+            summary: 'codesearch container {{ `{{ $labels.container }}` }} is restarting'
+            description: '{{ `{{ $labels.pod }}/{{ $labels.container }}` }} restarted {{ `{{ $value | humanize }}` }} times in the last hour.'
+            runbook_url: {{ $runbook }}#codesearchrestarting
+        {{- end }}
+{{- end }}

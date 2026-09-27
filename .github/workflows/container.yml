@@ -48,6 +48,8 @@ jobs:
         run: ct lint --config .github/ct.yaml --all
       - name: helm template (values combinations)
         run: charts/codesearch/ci/template-test.sh
+      - name: Monitoring (promtool check/test rules, dashboard)
+        run: charts/codesearch/ci/monitoring-test.sh
 
   image:
     runs-on: ubuntu-latest
@@ -80,7 +82,7 @@ jobs:
             REVISION=${{ github.sha }}
           cache-from: type=gha,scope=codesearch-amd64
           cache-to: type=gha,scope=codesearch-amd64,mode=max
-      - name: Smoke test (serve, healthz, metrics, MCP initialize)
+      - name: Smoke test (serve, healthz, metrics, MCP initialize, mdb_copy backup/restore)
         run: docker/smoke-test.sh "${{ steps.meta.outputs.image }}"
       - name: stdio MCP round trip
         run: docker/stdio-test.sh "${{ steps.meta.outputs.image }}" "$PWD/charts"
@@ -95,5 +97,5 @@ jobs:
           cluster_name: codesearch-ci
       - name: Load image into kind
         run: kind load docker-image "${{ steps.meta.outputs.image }}" --name codesearch-ci
-      - name: ct install (helm test checks healthz, metrics and MCP initialize)
+      - name: ct install, both auth modes (helm test checks healthz, metrics and MCP initialize)
         run: ct install --config .github/ct.yaml --all

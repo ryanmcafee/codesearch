@@ -61,6 +61,7 @@ out="$(render "${monitoring[@]}" -f "$chart/ci/networkpolicy-values.yaml" \
 expect_eq "$(query "$out" Deployment codesearch '.spec.template.spec.containers[0].args | join(" ")')" "serve --host 127.0.0.1 --port 39726 --no-tui" "serve args"
 expect_eq "$(query "$out" Deployment codesearch '.spec.template.spec.containers[] | select(.name == "forwarder") | .command | join(" ")')" "socat TCP-LISTEN:39725,fork,reuseaddr TCP:127.0.0.1:39726" "forwarder command"
 expect_eq "$(query "$out" Deployment codesearch '.spec.template.spec.containers[] | select(.name == "forwarder") | .ports[0].name')" http "forwarder port name"
+expect_eq "$(query "$out" Deployment codesearch '.spec.template.spec.containers[0].readinessProbe.httpGet.port')" 39725 "serve probes go through the forwarder port"
 expect_eq "$(query "$out" Deployment codesearch '.spec.template.spec.containers[] | select(.name == "repo-sync") | .env[] | select(.name == "SERVE_PORT") | .value')" 39726 "repo-sync talks to loopback serve"
 expect_eq "$(query "$out" NetworkPolicy codesearch '.spec.ingress[0].from[0].namespaceSelector.matchLabels.codesearch-client')" true "client namespace selector"
 expect_eq "$(query "$out" NetworkPolicy codesearch '.spec.ingress[0].from[1].namespaceSelector.matchLabels["kubernetes.io/metadata.name"]')" monitoring "extra peer"

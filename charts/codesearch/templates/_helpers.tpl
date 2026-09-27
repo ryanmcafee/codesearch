@@ -122,3 +122,19 @@ job="{{ include "codesearch.fullname" . }}", namespace="{{ .Release.Namespace }}
 {{- define "codesearch.podRegex" -}}
 {{ include "codesearch.fullname" . }}-[a-z0-9]+-[a-z0-9]+
 {{- end }}
+
+{{/*
+A probe with `port: http` resolved to the Service port: in networkPolicy mode the `http` port
+belongs to the forwarder container, and probes resolve named ports in their own container.
+*/}}
+{{- define "codesearch.probe" -}}
+{{- $probe := deepCopy (index . 0) -}}
+{{- $root := index . 1 -}}
+{{- range $kind := list "httpGet" "tcpSocket" -}}
+{{- $handler := index $probe $kind -}}
+{{- if and $handler (eq (toString $handler.port) "http") -}}
+{{- $_ := set $handler "port" $root.Values.serve.port -}}
+{{- end -}}
+{{- end -}}
+{{- toYaml $probe -}}
+{{- end }}

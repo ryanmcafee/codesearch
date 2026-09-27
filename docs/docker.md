@@ -82,6 +82,22 @@ claude mcp add --transport http codesearch http://localhost:39725/mcp \
 use another name (a reverse proxy, another container), list it in `CODESEARCH_ALLOWED_HOSTS`
 (comma-separated; an entry without a port matches any port).
 
+## Backups
+
+The image also ships `mdb_copy`/`mdb_stat` built from the LMDB sources codesearch links (Debian's
+`lmdb-utils` cannot open codesearch's LMDB files) and GNU tar, so it can back up its own state while
+serve runs:
+
+```bash
+docker exec codesearch sh -ec 'mkdir -p /tmp/bk/minilm-l6-q
+  mdb_copy -c ~/.codesearch/embedding_cache/minilm-l6-q /tmp/bk/minilm-l6-q
+  cp ~/.codesearch/repos.json /tmp/bk/ && tar -C /tmp/bk -czf /tmp/codesearch-backup.tgz .'
+docker cp codesearch:/tmp/codesearch-backup.tgz .
+```
+
+Indexes (`<repo>/.codesearch.db`) are derived from git and are cheaper to rebuild than to back up.
+See [runbooks](runbooks/README.md#operations) for restore steps.
+
 ## Stopping
 
 codesearch shuts down cleanly on `SIGINT`; the image sets `STOPSIGNAL SIGINT`, so

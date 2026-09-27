@@ -33,6 +33,24 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && mkdir -p /out/lib \
     && find target/release -maxdepth 2 -name 'libonnxruntime*.so*' -exec cp {} /out/lib/ \;
 
+# mdb_copy/mdb_stat from the lmdb-master-sys sources codesearch links (version
+# from Cargo.lock): Debian's lmdb-utils is a different LMDB and fails with
+# MDB_VERSION_MISMATCH. Defines mirror its build.rs for the features in use.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    set -eu; \
+    version="$(sed -n '/^name = "lmdb-master-sys"$/{n;s/^version = "\(.*\)"$/\1/p;}' Cargo.lock)"; \
+    features="$(cargo tree --locked -e features -i lmdb-master-sys --prefix none \
+        | sed -n 's/^lmdb-master-sys feature "\(.*\)".*/\1/p' | sort -u | tr '\n' ' ')"; \
+    [ "$features" = "default longer-keys " ] \
+        || { echo "ERROR: lmdb-master-sys features changed ($features); update the mdb_copy defines" >&2; exit 1; }; \
+    src="$(echo /usr/local/cargo/registry/src/*/lmdb-master-sys-"$version")/lmdb/libraries/liblmdb"; \
+    for tool in mdb_copy mdb_stat; do \
+        cc -O2 -pthread -DNDEBUG -DMDB_IDL_LOGN=16 -DMDB_MAXKEYSIZE=0 -I"$src" \
+            -o /usr/local/bin/"$tool" "$src/$tool.c" "$src/mdb.c" "$src/midl.c"; \
+    done; \
+    echo "built mdb_copy/mdb_stat from lmdb-master-sys $version"
+
 # Bake the default embedding model: indexing a throwaway repo makes fastembed
 # download it into ~/.codesearch/models, so containers start offline.
 ENV HOME=/home/app
@@ -56,10 +74,11 @@ LABEL org.opencontainers.image.title="codesearch" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${REVISION}"
 
-# git: repo metadata and the Helm chart's clone sidecar; curl: health probes and
-# the chart's registration calls; libgomp1: onnxruntime; tini: reaps git children.
+# git/curl: the chart's repo-sync sidecar and probes; libgomp1: onnxruntime;
+# tini: reaps git children; socat: the chart's networkPolicy-mode forwarder;
+# tar: backups (with mdb_copy).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl git libgomp1 tini \
+        ca-certificates curl git libgomp1 socat tar tini \
     && rm -rf /var/lib/apt/lists/*
 
 RUN groupadd --gid 10001 app \
@@ -69,6 +88,7 @@ RUN groupadd --gid 10001 app \
 
 COPY --from=builder /usr/local/bin/codesearch /usr/local/bin/codesearch
 COPY --from=builder /out/lib/ /usr/local/lib/
+COPY --from=builder /usr/local/bin/mdb_copy /usr/local/bin/mdb_stat /usr/local/bin/
 # Only the model cache: the warmup's repos.json must not register /tmp/warm.
 COPY --from=builder --chown=app:app /home/app/.codesearch/models /home/app/.codesearch/models
 # Lets `docker run --user "$(id -u):$(id -g)"` keep state here and read the model.

@@ -1,0 +1,225 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "codesearch.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "codesearch.labels" . | nindent 4 }}
+spec:
+  # One replica only: MCP sessions are held in memory and indexes have a single writer.
+  replicas: 1
+  strategy:
+    {{- toYaml .Values.strategy | nindent 4 }}
+  selector:
+    matchLabels:
+      {{- include "codesearch.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/repo-sync: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "codesearch.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "codesearch.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      initContainers:
+        # The data volume hides the model baked into the image; copy it in so serve starts offline.
+        - name: seed-model
+          image: {{ include "codesearch.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - >-
+              mkdir -p {{ include "codesearch.stateDir" . }}/models {{ include "codesearch.reposRoot" . }}
+              && cp -a --update=none /home/app/.codesearch/models/. {{ include "codesearch.stateDir" . }}/models/
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          resources:
+            {{- toYaml .Values.repositories.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+        {{- with .Values.extraInitContainers }}
+        {{- tpl (toYaml .) $ | nindent 8 }}
+        {{- end }}
+      containers:
+        - name: codesearch
+          image: {{ include "codesearch.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - serve
+            - --host
+            - {{ include "codesearch.serveHost" . }}
+            - --port
+            - {{ include "codesearch.servePort" . | quote }}
+            - --no-tui
+            {{- range .Values.serve.extraArgs }}
+            - {{ . | quote }}
+            {{- end }}
+          {{- if include "codesearch.apiKeyAuth" . }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.serve.port }}
+              protocol: TCP
+          {{- end }}
+          env:
+            - name: HOME
+              value: /data/home
+            {{- if include "codesearch.apiKeyAuth" . }}
+            - name: CODESEARCH_SERVE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "codesearch.apiKeySecretName" . }}
+                  key: {{ include "codesearch.apiKeySecretKey" . }}
+            {{- end }}
+            - name: CODESEARCH_ALLOWED_HOSTS
+              value: {{ include "codesearch.allowedHosts" . | quote }}
+            - name: CODESEARCH_ALLOWED_ROOTS
+              value: {{ include "codesearch.allowedRoots" . | quote }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.extraEnvFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.startupProbe }}
+          startupProbe:
+            {{- include "codesearch.probe" (list . $) | nindent 12 }}
+          {{- end }}
+          {{- with .Values.livenessProbe }}
+          livenessProbe:
+            {{- include "codesearch.probe" (list . $) | nindent 12 }}
+          {{- end }}
+          {{- with .Values.readinessProbe }}
+          readinessProbe:
+            {{- include "codesearch.probe" (list . $) | nindent 12 }}
+          {{- end }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+        {{- if not (include "codesearch.apiKeyAuth" .) }}
+        # Serve only listens on loopback in networkPolicy mode; this exposes it on the pod IP.
+        - name: forwarder
+          image: {{ include "codesearch.forwarderImage" . }}
+          imagePullPolicy: {{ .Values.forwarder.image.pullPolicy | default .Values.image.pullPolicy }}
+          command:
+            - socat
+            - TCP-LISTEN:{{ .Values.serve.port }},fork,reuseaddr
+            - TCP:127.0.0.1:{{ .Values.serve.internalPort }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.serve.port }}
+              protocol: TCP
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          resources:
+            {{- toYaml .Values.forwarder.resources | nindent 12 }}
+        {{- end }}
+        {{- if .Values.repositories.urls }}
+        - name: repo-sync
+          image: {{ include "codesearch.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/bin/bash", "/etc/codesearch/repo-sync.sh"]
+          env:
+            - name: HOME
+              value: /tmp
+            - name: REPOS_ROOT
+              value: {{ include "codesearch.reposRoot" . }}
+            - name: REPOS_FILE
+              value: /etc/codesearch/repositories
+            - name: FORCE_REINDEX_MARKER
+              value: {{ include "codesearch.stateDir" . }}/force-reindex
+            - name: SERVE_PORT
+              value: {{ include "codesearch.servePort" . | quote }}
+            - name: SYNC_INTERVAL
+              value: {{ .Values.repositories.intervalSeconds | quote }}
+            - name: PRUNE
+              value: {{ .Values.repositories.prune | quote }}
+            {{- if include "codesearch.apiKeyAuth" . }}
+            - name: CODESEARCH_SERVE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "codesearch.apiKeySecretName" . }}
+                  key: {{ include "codesearch.apiKeySecretKey" . }}
+            {{- end }}
+            {{- with .Values.repositories.tokenSecret.name }}
+            - name: GIT_USERNAME
+              value: {{ $.Values.repositories.username | quote }}
+            - name: GIT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . }}
+                  key: {{ $.Values.repositories.tokenSecret.key }}
+            {{- end }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          resources:
+            {{- toYaml .Values.repositories.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+            - name: repo-sync
+              mountPath: /etc/codesearch
+              readOnly: true
+        {{- end }}
+        {{- with .Values.extraContainers }}
+        {{- tpl (toYaml .) $ | nindent 8 }}
+        {{- end }}
+      volumes:
+        - name: data
+          {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "codesearch.dataClaimName" . }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        - name: tmp
+          emptyDir: {}
+        {{- if .Values.repositories.urls }}
+        - name: repo-sync
+          configMap:
+            name: {{ include "codesearch.fullname" . }}-repo-sync
+        {{- end }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

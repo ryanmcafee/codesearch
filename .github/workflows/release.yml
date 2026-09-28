@@ -265,3 +265,196 @@ jobs:
           files: artifacts/*
           generate_release_notes: true
           tag_name: ${{ inputs.version || github.ref_name }}
+
+  # Container image: one native build per architecture (no QEMU for the Rust
+  # build), pushed by digest, then merged into one multi-arch manifest.
+  image:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            platform: linux/amd64
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      # pin@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.version) || github.ref }}
+          persist-credentials: false
+
+      # pin@v4.4.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
+
+      # pin@v4.6.0
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve version
+        id: ver
+        env:
+          TAG: ${{ inputs.version || github.ref_name }}
+        run: echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push by digest
+        id: build
+        # pin@v7.4.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            VERSION=${{ steps.ver.outputs.version }}
+            REVISION=${{ github.sha }}
+          outputs: type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=codesearch-${{ matrix.arch }}
+          cache-to: type=gha,scope=codesearch-${{ matrix.arch }},mode=max
+
+      - name: Export digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p digests
+          touch "digests/${DIGEST#sha256:}"
+
+      - name: Upload digest
+        # pin@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: image-digest-${{ matrix.arch }}
+          path: digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  image-manifest:
+    needs: [image]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Download digests
+        # pin@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          path: digests
+          pattern: image-digest-*
+          merge-multiple: true
+
+      # pin@v4.4.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
+
+      # pin@v4.6.0
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create multi-arch manifest (vX.Y.Z, X.Y.Z, X.Y, latest)
+        env:
+          TAG: ${{ inputs.version || github.ref_name }}
+          IMAGE: ghcr.io/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          tags=(-t "${IMAGE}:v${version}" -t "${IMAGE}:${version}")
+          # Pre-releases (1.7.0-rc.1) get only their exact tags.
+          if [[ "$version" =~ ^([0-9]+)\.([0-9]+)\.[0-9]+$ ]]; then
+            tags+=(-t "${IMAGE}:${BASH_REMATCH[1]}.${BASH_REMATCH[2]}" -t "${IMAGE}:latest")
+          fi
+          sources=()
+          for digest in digests/*; do
+            sources+=("${IMAGE}@sha256:$(basename "$digest")")
+          done
+          docker buildx imagetools create "${tags[@]}" \
+            --annotation "index:org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
+            --annotation "index:org.opencontainers.image.version=${version}" \
+            --annotation "index:org.opencontainers.image.licenses=Apache-2.0" \
+            --annotation "index:org.opencontainers.image.description=Local semantic code search MCP server" \
+            "${sources[@]}"
+          docker buildx imagetools inspect "${IMAGE}:v${version}"
+
+  # Helm chart: GitHub Pages repo (gh-pages, via chart-releaser) and OCI
+  # (ghcr.io/<owner>/charts/codesearch). Runs after the image so the chart's
+  # default tag always exists.
+  chart:
+    needs: [image-manifest]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      # pin@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.version) || github.ref }}
+          fetch-depth: 0
+          # chart-releaser pushes index.yaml to gh-pages with these credentials.
+          persist-credentials: true
+
+      # pin@v5.0.1
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Set chart version and appVersion from the tag
+        env:
+          TAG: ${{ inputs.version || github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          sed -i -E "s/^version: .*/version: ${version}/; s/^appVersion: .*/appVersion: \"${version}\"/" charts/codesearch/Chart.yaml
+          grep -E '^(version|appVersion):' charts/codesearch/Chart.yaml
+
+      - name: Create gh-pages branch if missing
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --heads origin gh-pages >/dev/null; then
+            exit 0
+          fi
+          git worktree add --orphan -b gh-pages "$RUNNER_TEMP/gh-pages"
+          printf 'apiVersion: v1\nentries: {}\n' > "$RUNNER_TEMP/gh-pages/index.yaml"
+          touch "$RUNNER_TEMP/gh-pages/.nojekyll"
+          git -C "$RUNNER_TEMP/gh-pages" add index.yaml .nojekyll
+          git -C "$RUNNER_TEMP/gh-pages" commit -m "chore: initialize Helm repository"
+          git -C "$RUNNER_TEMP/gh-pages" push origin gh-pages
+          git worktree remove "$RUNNER_TEMP/gh-pages"
+
+      - name: Publish to the GitHub Pages Helm repository
+        # pin@v1.7.0
+        uses: helm/chart-releaser-action@cae68fefc6b5f367a0275617c9f83181ba54714f
+        with:
+          charts_dir: charts
+          # The chart's GitHub release (codesearch-X.Y.Z) must not replace the
+          # binary release as "latest".
+          mark_as_latest: false
+        env:
+          CR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push chart to ghcr.io (OCI)
+        env:
+          TAG: ${{ inputs.version || github.ref_name }}
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          echo "$REGISTRY_TOKEN" | helm registry login ghcr.io --username "$REGISTRY_USER" --password-stdin
+          package=".cr-release-packages/codesearch-${version}.tgz"
+          [ -f "$package" ] || helm package charts/codesearch --destination .cr-release-packages
+          helm push "$package" "oci://ghcr.io/${{ github.repository_owner }}/charts"

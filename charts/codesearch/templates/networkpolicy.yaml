@@ -1,0 +1,51 @@
+{{- if and (not (include "codesearch.apiKeyAuth" .)) (not .Values.networkPolicy.enabled) }}
+{{- fail "auth.mode=networkPolicy serves without an API key, so it requires networkPolicy.enabled=true" }}
+{{- end }}
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "codesearch.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "codesearch.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "codesearch.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    {{- if .Values.networkPolicy.egress }}
+    - Egress
+    {{- end }}
+  ingress:
+    - ports:
+        - port: http
+          protocol: TCP
+      from:
+        {{- range .Values.networkPolicy.ingress.namespaceSelectors }}
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml . | nindent 14 }}
+        {{- end }}
+        {{- with .Values.networkPolicy.ingress.extraPeers }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- if not (or .Values.networkPolicy.ingress.namespaceSelectors .Values.networkPolicy.ingress.extraPeers) }}
+        - podSelector: {}
+        {{- end }}
+        # The chart's helm test pod.
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ .Release.Name }}
+              app.kubernetes.io/component: test
+  {{- with .Values.networkPolicy.egress }}
+  egress:
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}

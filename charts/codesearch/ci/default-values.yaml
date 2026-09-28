@@ -1,0 +1,3 @@
+# ct install: pulls the image built in the same workflow run (kind load).
+image:
+  pullPolicy: Never

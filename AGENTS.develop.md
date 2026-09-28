@@ -249,6 +249,7 @@ Never `unwrap_or_default()` a store error on a search path — "no results" and 
 
 ## Changelog highlights (recent)
 
+- **v1.7.0** -- container image `ghcr.io/ryanmcafee/codesearch` (multi-arch, model and ABI-matched `mdb_copy` baked in) and Helm chart `charts/codesearch` (single `data` volume, `auth.mode` apiKey|networkPolicy, repo-sync with prune and force-reindex marker, ServiceMonitor/PrometheusRule/dashboard with `docs/runbooks`), both published by `release.yml`; `container.yml` smoke-tests the image, runs promtool rule tests and `ct install`s both auth modes on kind
 - **v1.5.1** -- group fan-out resolves and fuses hits by (store, chunk id): per-repo chunk ids collide, so group search/find/similar used to return chunks from the wrong repo
 - **v1.5.0** — read path isolated from indexing: lock-free snapshot reads with atomic `replace_chunks` publishes, a background-QoS indexing pool, an in-process indexing governor that yields to slow tool calls, tool-call p50..p100 in `/status` / `status(kind="health")`, and watcher ignore parity with the full walk; health dashboard at `/dashboard` with `/api/{summary,latency,repos,events}` and matching `status` kinds
 - **v1.4.4** — resident C# workspace pool no longer serves stale `find_impact` results after a rebuild: `WorkspacePool::evict` bumps a per-solution generation counter closing a spawn-in-flight race, and `scip_ref_cache` is now cleared unconditionally on both full and incremental rebuilds

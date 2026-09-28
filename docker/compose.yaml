@@ -1,0 +1,31 @@
+# codesearch serve over HTTP on localhost.
+#
+#   export CODESEARCH_SERVE_API_KEY=$(openssl rand -hex 32)
+#   REPOS_DIR=$HOME/Projects docker compose -f docker/compose.yaml up -d
+#
+# See docs/docker.md.
+services:
+  codesearch:
+    image: ghcr.io/ryanmcafee/codesearch:${CODESEARCH_VERSION:-latest}
+    restart: unless-stopped
+    # On Linux, run as the owner of REPOS_DIR: CODESEARCH_UID=$(id -u) CODESEARCH_GID=$(id -g).
+    user: "${CODESEARCH_UID:-10001}:${CODESEARCH_GID:-10001}"
+    ports:
+      - "127.0.0.1:39725:39725"
+    environment:
+      CODESEARCH_SERVE_API_KEY: ${CODESEARCH_SERVE_API_KEY:?set CODESEARCH_SERVE_API_KEY}
+      CODESEARCH_ALLOWED_ROOTS: /repos
+    volumes:
+      - codesearch-data:/home/app/.codesearch
+      # Writable: each repo's index is stored in <repo>/.codesearch.db.
+      - ${REPOS_DIR:?set REPOS_DIR}:/repos
+    stop_signal: SIGINT
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:39725/healthz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+
+volumes:
+  codesearch-data:

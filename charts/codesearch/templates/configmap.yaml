@@ -1,0 +1,19 @@
+{{- if .Values.repositories.urls }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "codesearch.fullname" . }}-repo-sync
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "codesearch.labels" . | nindent 4 }}
+data:
+  repo-sync.sh: |
+    {{- .Files.Get "files/repo-sync.sh" | nindent 4 }}
+  # alias|url|branch|depth
+  repositories: |
+    {{- range .Values.repositories.urls }}
+    {{- $repo := kindIs "string" . | ternary (dict "url" .) . }}
+    {{- $alias := $repo.alias | default (base $repo.url | trimSuffix ".git") }}
+    {{ $alias }}|{{ $repo.url }}|{{ $repo.branch | default "" }}|{{ hasKey $repo "depth" | ternary $repo.depth $.Values.repositories.depth }}
+    {{- end }}
+{{- end }}

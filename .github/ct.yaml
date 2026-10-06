@@ -1,0 +1,8 @@
+# chart-testing config for .github/workflows/container.yml.
+target-branch: develop
+chart-dirs:
+  - charts
+# The chart version follows the codesearch release tag (set by release.yml).
+check-version-increment: false
+validate-maintainers: false
+helm-extra-args: --timeout 600s

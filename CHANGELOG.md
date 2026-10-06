@@ -14,6 +14,19 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.7.0]
+
+### Added
+
+- **Container image `ghcr.io/ryanmcafee/codesearch`.** Multi-arch (`linux/amd64`, `linux/arm64`, built natively per architecture) from `docker/Dockerfile`, published by the release workflow as `vX.Y.Z`, `X.Y.Z`, `X.Y` and `latest`. Non-root, embedding model baked in for offline starts, `codesearch` as entrypoint so `docker run -i IMAGE mcp /workspace` (stdio) and `docker run IMAGE serve ...` (HTTP) both work, and `SIGINT` as stop signal so `docker stop` shuts serve down cleanly. Ships `mdb_copy`/`mdb_stat` built from the LMDB sources codesearch links (Debian's `lmdb-utils` fails with `MDB_VERSION_MISMATCH`), GNU tar and socat, so backups can hot-copy the embedding cache with the same image. Guide: `docs/docker.md`, with a `docker/compose.yaml` example.
+- **Helm chart `charts/codesearch`.** Runs `codesearch serve` with one `data` volume (`/data`, `HOME=/data/home`, checkouts in `/data/repos`), a generated (upgrade-stable) or existing API key Secret, `CODESEARCH_ALLOWED_HOSTS` derived from the Service and Ingress names and `CODESEARCH_ALLOWED_ROOTS` pinned to `/data/repos`. `auth.mode: networkPolicy` serves on loopback behind a socat forwarder with no key, guarded by a required NetworkPolicy. The `repo-sync` sidecar clones, fetches and registers `repositories.urls`, reindexes on new commits, prunes removed repos and force-reindexes everything once when `force-reindex` is touched (tokens go in an HTTP header, never to disk). Extension points: `extraInitContainers`/`extraContainers` (through `tpl`), `extraVolumes`, `extraVolumeMounts`, `persistence.existingClaim`. Released with each version to `https://ryanmcafee.github.io/codesearch` and `oci://ghcr.io/ryanmcafee/charts/codesearch`. Guide: `docs/kubernetes.md`.
+- **Monitoring in the chart.** A ServiceMonitor and a PrometheusRule (rendered only when the Prometheus Operator CRDs exist) with ten alerts (down, degraded, tool-call errors and latency against the SLO, failing, stale and queued indexing, memory, volume usage, restarts), each with thresholds in values and a `runbook_url` into `docs/runbooks`; a Grafana dashboard ConfigMap for the kube-prometheus-stack sidecar. Runbooks cover every alert plus backup, restore and upgrades.
+
+### Fixed
+
+- **The Azure federation image builds again.** Since the `search_fanout` benchmark was declared in `Cargo.toml` (v1.6.0), the root `Dockerfile` failed at `cargo build` because `benches/` was not copied into the build context.
+- **`codesearch cache stats` and `cache clear` find the embedding cache.** They looked in `~/.codesearch/models/embedding_cache` instead of `~/.codesearch/embedding_cache` and always reported "No cache found"; without a model argument they failed with "Failed to parse model name", and an unknown model name silently meant every model. Now no argument means every model, an unknown name is an error, and the all-models total reports models and entries separately.
+
 ## [1.6.1] - 2026-09-25
 
 ### Fixed

@@ -1,0 +1,13 @@
+# auth.mode=networkPolicy: serve on loopback behind the forwarder, no API key.
+image:
+  pullPolicy: Never
+auth:
+  mode: networkPolicy
+networkPolicy:
+  enabled: true
+repositories:
+  urls:
+    - url: https://github.com/octocat/Spoon-Knife.git
+      alias: spoon-knife
+persistence:
+  size: 1Gi

@@ -99,6 +99,15 @@ cd codesearch
 cargo build --release
 ```
 
+Or run the container image (`linux/amd64`, `linux/arm64`) or the Helm chart:
+
+```bash
+claude mcp add codesearch -- docker run -i --rm --user "$(id -u):$(id -g)" -v "$PWD:/workspace" ghcr.io/ryanmcafee/codesearch mcp --mode local /workspace
+helm repo add codesearch https://ryanmcafee.github.io/codesearch && helm install codesearch codesearch/codesearch
+```
+
+See [docs/docker.md](docs/docker.md) (stdio and HTTP modes) and [docs/kubernetes.md](docs/kubernetes.md).
+
 ### Index a repository
 
 ```bash

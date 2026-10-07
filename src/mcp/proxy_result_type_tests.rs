@@ -1,4 +1,4 @@
-//! Wire-level `resultType` (SEP-2322) checks for results the proxy forwards
+//! Wire-level `resultType` (SEP-2322) and cache-hint (SEP-2549) checks for results the proxy forwards
 //! from the serve hub, across old and new downstream protocol versions.
 
 use super::McpProxyService;
@@ -142,6 +142,8 @@ async fn stateless_2026_07_28_client_gets_complete_result_type() {
         .request(2, "tools/list", json!({"_meta": stateless_meta()}))
         .await;
     assert_eq!(tools["resultType"], "complete", "tools/list: {tools}");
+    assert_eq!(tools["ttlMs"], 0, "tools/list: {tools}");
+    assert_eq!(tools["cacheScope"], "public", "tools/list: {tools}");
     assert_eq!(tools["tools"][0]["name"], "search");
 
     let mut params = call_search_params();
@@ -159,6 +161,10 @@ async fn legacy_clients_keep_the_pre_2026_wire_shape() {
         let tools = client.request(2, "tools/list", json!({})).await;
         assert!(
             tools.get("resultType").is_none(),
+            "{protocol_version} tools/list: {tools}"
+        );
+        assert!(
+            tools.get("ttlMs").is_none() && tools.get("cacheScope").is_none(),
             "{protocol_version} tools/list: {tools}"
         );
         assert_eq!(tools["tools"][0]["name"], "search");

@@ -1,7 +1,7 @@
 use rmcp::{
     model::{
-        CallToolRequestParams, CallToolResponse, Implementation, ListToolsResult,
-        PaginatedRequestParams, ResultType, ServerCapabilities, ServerConfig,
+        CacheScope, CallToolRequestParams, CallToolResponse, Implementation, ListToolsResult,
+        PaginatedRequestParams, ProtocolVersion, ResultType, ServerCapabilities, ServerConfig,
     },
     service::RequestContext,
     ErrorData as McpError, RoleClient, RoleServer, ServerHandler,
@@ -355,6 +355,14 @@ fn mark_complete_if_absent(result_type: &mut Option<ResultType>) {
     result_type.get_or_insert(ResultType::COMPLETE);
 }
 
+/// Mirrors rmcp's `#[tool_handler]` hints, which the legacy hub leg never sends.
+fn add_cache_hints(result: &mut ListToolsResult, protocol_version: Option<ProtocolVersion>) {
+    if protocol_version.is_some_and(|v| v >= ProtocolVersion::V_2026_07_28) {
+        result.ttl_ms.get_or_insert(0);
+        result.cache_scope.get_or_insert(CacheScope::Public);
+    }
+}
+
 impl ServerHandler for McpProxyService {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
@@ -370,7 +378,7 @@ impl ServerHandler for McpProxyService {
     async fn list_tools(
         &self,
         request: Option<PaginatedRequestParams>,
-        _cx: RequestContext<RoleServer>,
+        cx: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
         let _in_flight = InFlightGuard::new(&self.in_flight);
         let mut last_err: Option<String> = None;
@@ -381,6 +389,7 @@ impl ServerHandler for McpProxyService {
                     Ok(mut r) => {
                         self.mark_activity();
                         mark_complete_if_absent(&mut r.result_type);
+                        add_cache_hints(&mut r, cx.protocol_version());
                         return Ok(r);
                     }
                     Err(e) => {

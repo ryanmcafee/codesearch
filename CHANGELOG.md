@@ -14,6 +14,12 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.7.1]
+
+### Fixed
+
+- **`tools/list` via the stdio proxy rejected by 2026-07-28 clients.** The proxy forwarded the hub's result without the SEP-2549 cache hints, so Claude Code failed with `Invalid input: expected number` on `ttlMs` and `Invalid option` on `cacheScope` and loaded no tools. The proxy now adds `ttlMs: 0` and `cacheScope: "public"` for 2026-07-28 peers, matching `#[tool_handler]`; legacy peers keep the old shape.
+
 ## [1.7.0] - 2026-10-06
 
 ### Added

@@ -4,6 +4,30 @@ entries:
   - annotations:
       artifacthub.io/license: Apache-2.0
     apiVersion: v2
+    appVersion: 1.7.2
+    created: "2026-11-27T18:21:13.471717923Z"
+    description: Semantic code search MCP server (codesearch serve) for coding agents
+    digest: 20637aee56320f5a4cf70d1e7c3e0ba1e74fdd4b24b86899eebf9e5952914337
+    home: https://github.com/ryanmcafee/codesearch
+    keywords:
+    - mcp
+    - code-search
+    - semantic-search
+    - embeddings
+    kubeVersion: '>=1.25.0-0'
+    maintainers:
+    - name: ryanmcafee
+      url: https://github.com/ryanmcafee
+    name: codesearch
+    sources:
+    - https://github.com/ryanmcafee/codesearch
+    type: application
+    urls:
+    - https://github.com/ryanmcafee/codesearch/releases/download/codesearch-1.7.2/codesearch-1.7.2.tgz
+    version: 1.7.2
+  - annotations:
+      artifacthub.io/license: Apache-2.0
+    apiVersion: v2
     appVersion: 1.7.1
     created: "2026-10-07T18:01:57.048335083Z"
     description: Semantic code search MCP server (codesearch serve) for coding agents
@@ -49,4 +73,4 @@ entries:
     urls:
     - https://github.com/ryanmcafee/codesearch/releases/download/codesearch-1.7.0/codesearch-1.7.0.tgz
     version: 1.7.0
-generated: "2026-10-07T18:01:57.048345132Z"
+generated: "2026-11-27T18:21:13.471732165Z"

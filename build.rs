@@ -48,4 +48,36 @@ fn main() {
 
     // Also set for display in --version output
     println!("cargo:rustc-env=CARGO_PKG_VERSION_FULL={}", version_full);
+
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        link_clang_runtime();
+    }
+}
+
+// ONNX Runtime's prebuilt CoreML objects call `@available`, which needs `___isPlatformVersionAtLeast`.
+fn link_clang_runtime() {
+    let resource_dir = Command::new("xcrun")
+        .args(["clang", "--print-resource-dir"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|s| s.trim().to_string());
+
+    let Some(resource_dir) = resource_dir else {
+        println!(
+            "cargo:warning=`xcrun clang --print-resource-dir` failed; libclang_rt.osx.a not linked"
+        );
+        return;
+    };
+
+    let runtime = std::path::Path::new(&resource_dir).join("lib/darwin/libclang_rt.osx.a");
+    if !runtime.exists() {
+        println!(
+            "cargo:warning={} not found; link may fail on undefined ___isPlatformVersionAtLeast",
+            runtime.display()
+        );
+        return;
+    }
+    println!("cargo:rustc-link-arg={}", runtime.display());
 }

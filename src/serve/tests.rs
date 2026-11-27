@@ -911,8 +911,10 @@ async fn add_repo_handler_registers_brand_new_repo_without_rollback() {
 /// serve-wide default's dimension (`codesearch serve --model X`), not the
 /// built-in 384-dim default. This is the write-side counterpart of the per-repo
 /// query-model contract.
+#[serial]
 #[tokio::test]
 async fn add_repo_handler_uses_serve_default_model_for_new_index() {
+    let _env = crate::testing::EnvRestore::remove(&[ALLOWED_ROOTS_ENV]);
     let tmp = tempfile::tempdir().unwrap();
     let repo_path = tmp.path().join("defaulted");
     std::fs::create_dir(&repo_path).unwrap();
@@ -953,8 +955,10 @@ async fn add_repo_handler_uses_serve_default_model_for_new_index() {
 /// The serve-wide default must NOT override an index that already records its
 /// own model: re-adding a repo whose `.codesearch.db` is still on disk keeps the
 /// recorded model and dimension.
+#[serial]
 #[tokio::test]
 async fn add_repo_handler_keeps_recorded_model_over_serve_default() {
+    let _env = crate::testing::EnvRestore::remove(&[ALLOWED_ROOTS_ENV]);
     let tmp = tempfile::tempdir().unwrap();
     let repo_path = tmp.path().join("existing");
     std::fs::create_dir(&repo_path).unwrap();

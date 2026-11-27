@@ -15,6 +15,11 @@ on:
         required: false
         type: boolean
         default: true
+      rust_toolchain:
+        description: "Rust toolchain override for rebuilding an old tag (e.g. 1.99.0); empty uses rust-toolchain.toml"
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -51,7 +56,15 @@ jobs:
         # pin@stable
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
         with:
+          toolchain: ${{ inputs.rust_toolchain || 'stable' }}
           targets: ${{ matrix.target }}
+
+      - name: Override rust-toolchain.toml
+        if: inputs.rust_toolchain != ''
+        shell: bash
+        env:
+          RUST_TOOLCHAIN: ${{ inputs.rust_toolchain }}
+        run: echo "RUSTUP_TOOLCHAIN=${RUST_TOOLCHAIN}" >> "$GITHUB_ENV"
 
       - name: Install protoc
         # pin@v3
@@ -160,7 +173,15 @@ jobs:
         # pin@stable
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
         with:
+          toolchain: ${{ inputs.rust_toolchain || 'stable' }}
           targets: aarch64-apple-darwin
+
+      - name: Override rust-toolchain.toml
+        if: inputs.rust_toolchain != ''
+        shell: bash
+        env:
+          RUST_TOOLCHAIN: ${{ inputs.rust_toolchain }}
+        run: echo "RUSTUP_TOOLCHAIN=${RUST_TOOLCHAIN}" >> "$GITHUB_ENV"
 
       - name: Install protoc
         # pin@v3

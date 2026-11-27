@@ -14,6 +14,12 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.7.2]
+
+### Fixed
+
+- **Windows builds fail on Rust 1.100+.** Cargo's new build-dir layout made the ort-sys 2.0.0-rc.13 build script copy the DirectML DLLs into a directory that does not exist, panicking with "The system cannot find the path specified". fastembed 7.8.0 pulls ort 2.0.0-rc.15, which locates the target directory correctly.
+
 ## [1.7.1] - 2026-10-07
 
 ### Fixed

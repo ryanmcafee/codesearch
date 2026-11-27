@@ -470,6 +470,8 @@ jobs:
           # The chart's GitHub release (codesearch-X.Y.Z) must not replace the
           # binary release as "latest".
           mark_as_latest: false
+          # A re-run must not fail on the chart release an earlier run created.
+          skip_existing: true
         env:
           CR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

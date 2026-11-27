@@ -14,6 +14,12 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.7.3]
+
+### Fixed
+
+- **Linux release binaries require glibc 2.43.** `ubuntu-latest` moved to Ubuntu 26.04, so the Linux binary failed on older distributions with "version `GLIBC_2.43' not found". The Linux release build now runs on Ubuntu 24.04 (glibc 2.39), as releases up to 1.7.1 did.
+
 ## [1.7.2] - 2026-11-27
 
 ### Fixed
